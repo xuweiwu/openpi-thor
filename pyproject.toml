@@ -18,6 +18,7 @@ openpi-thor = "openpi_thor.cli:main"
 [dependency-groups]
 thor-pytorch = [
     "torch==2.11.0",
+    "torchvision==0.26.0",
 ]
 thor-runtime = [
     "numpy>=2",
