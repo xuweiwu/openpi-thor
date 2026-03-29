@@ -220,7 +220,7 @@ Real bundle flow:
 .venv-thor/bin/openpi-thor convert-jax \
   --config <PI05_TRAIN_CONFIG> \
   --checkpoint-dir /path/to/jax-checkpoint \
-  --output-dir /path/to/bundle
+  --bundle-dir /path/to/bundle
 
 .venv-thor/bin/openpi-thor prepare-engine \
   --config <PI05_TRAIN_CONFIG> \

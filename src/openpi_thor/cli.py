@@ -19,7 +19,7 @@ class DoctorCommand:
 class ConvertJaxCommand:
     config: str
     checkpoint_dir: str
-    output_dir: str
+    bundle_dir: str
     precision: str = "bfloat16"
     copy_assets: bool = True
     overwrite: bool = False
@@ -132,7 +132,7 @@ def main() -> None:
             bundle = convert_jax_checkpoint(
                 command.config,
                 command.checkpoint_dir,
-                command.output_dir,
+                command.bundle_dir,
                 precision=command.precision,
                 copy_assets=command.copy_assets,
                 overwrite=command.overwrite,

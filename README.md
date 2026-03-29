@@ -104,11 +104,15 @@ openpi-thor doctor
 
 ### 6. Convert the JAX checkpoint into a bundle
 
+`convert-jax` creates the bundle directory. The path passed as `--bundle-dir` here is the
+same directory that later commands reuse as `--bundle-dir`. See
+[Bundle directories](#bundle-directories) below.
+
 ```bash
 openpi-thor convert-jax \
   --config <PI05_TRAIN_CONFIG> \
   --checkpoint-dir /path/to/jax-checkpoint \
-  --output-dir /path/to/bundle
+  --bundle-dir /path/to/bundle
 ```
 
 ### 7. Export ONNX and build a TensorRT engine

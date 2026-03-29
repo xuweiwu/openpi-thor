@@ -70,7 +70,7 @@ def inspect_jax_checkpoint(
 def convert_jax_checkpoint(
     config: str | _config.TrainConfig,
     checkpoint_dir: str | Path,
-    output_dir: str | Path,
+    bundle_dir: str | Path,
     *,
     precision: str = "bfloat16",
     copy_assets: bool = True,
@@ -79,37 +79,37 @@ def convert_jax_checkpoint(
     prepare_runtime()
     train_config = _resolve_train_config(config)
     checkpoint_dir = Path(checkpoint_dir).expanduser().resolve()
-    output_dir = Path(output_dir).expanduser().resolve()
+    bundle_dir = Path(bundle_dir).expanduser().resolve()
 
-    if output_dir.exists() and any(output_dir.iterdir()) and not overwrite:
-        raise FileExistsError(f"Refusing to overwrite non-empty output directory: {output_dir}")
+    if bundle_dir.exists() and any(bundle_dir.iterdir()) and not overwrite:
+        raise FileExistsError(f"Refusing to overwrite non-empty bundle directory: {bundle_dir}")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    bundle_dir.mkdir(parents=True, exist_ok=True)
 
     converter = _load_converter_module()
     model_config = train_config.model
     if hasattr(model_config, "pytorch_compile_mode"):
         model_config = dataclasses.replace(model_config, pytorch_compile_mode=None)
 
-    logger.info("Converting JAX checkpoint %s into PyTorch bundle %s", checkpoint_dir, output_dir)
+    logger.info("Converting JAX checkpoint %s into PyTorch bundle %s", checkpoint_dir, bundle_dir)
     converter.convert_pi0_checkpoint(
         str(checkpoint_dir),
         precision,
-        str(output_dir),
+        str(bundle_dir),
         model_config,
     )
 
-    if copy_assets and not (output_dir / "assets").exists():
+    if copy_assets and not (bundle_dir / "assets").exists():
         if assets_source := _resolve_assets_source(checkpoint_dir):
-            shutil.copytree(assets_source, output_dir / "assets", dirs_exist_ok=True)
+            shutil.copytree(assets_source, bundle_dir / "assets", dirs_exist_ok=True)
 
-    config_json = output_dir / "config.json"
+    config_json = bundle_dir / "config.json"
     if config_json.exists():
         config_payload = json.loads(config_json.read_text())
     else:
         config_payload = {}
 
-    bundle = default_bundle(output_dir, train_config.name)
+    bundle = default_bundle(bundle_dir, train_config.name)
     bundle.source_checkpoint_dir = str(checkpoint_dir)
     bundle.extra.update(
         {
@@ -123,11 +123,11 @@ def convert_jax_checkpoint(
             "phase": "convert_jax_to_pytorch",
             "config_name": train_config.name,
             "source_checkpoint_dir": str(checkpoint_dir),
-            "bundle_dir": str(output_dir),
+            "bundle_dir": str(bundle_dir),
             "precision": precision,
             "copy_assets": copy_assets,
-            "assets_dir": str(output_dir / "assets") if (output_dir / "assets").exists() else None,
-            "weight_path": str(output_dir / "model.safetensors"),
+            "assets_dir": str(bundle_dir / "assets") if (bundle_dir / "assets").exists() else None,
+            "weight_path": str(bundle_dir / "model.safetensors"),
             "config_json": config_payload,
         },
     )
