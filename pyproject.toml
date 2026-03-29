@@ -1,0 +1,91 @@
+[project]
+name = "openpi-thor"
+version = "0.1.0"
+description = "Thor-native OpenPI deployment utilities for conversion, export, validation, and TensorRT serving"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openpi",
+    "openpi-client",
+    "onnx>=1.18.0",
+    "safetensors>=0.4.0",
+    "tyro>=0.9.5",
+]
+
+[project.scripts]
+openpi-thor = "openpi_thor.cli:main"
+
+[dependency-groups]
+thor-pytorch = [
+    "torch==2.11.0",
+]
+thor-runtime = [
+    "numpy>=2",
+    "jax==0.5.3",
+    "jaxlib==0.5.3",
+    "accelerate>=1.10.0,<2.0.0",
+    "av>=15.0.0,<16.0.0",
+    "chex==0.1.89",
+    "deepdiff>=7.0.1,<9.0.0",
+    "draccus==0.10.0",
+    "flax==0.10.2",
+    "gymnasium>=1.1.1,<2.0.0",
+    "orbax-checkpoint==0.11.13",
+    "transformers==4.53.2",
+    "sentencepiece>=0.2.0",
+    "safetensors>=0.4.0",
+    "tyro>=0.9.5",
+    "jsonlines>=4.0.0,<5.0.0",
+    "onnx==1.18.0",
+    "onnx_graphsurgeon==0.5.8",
+    "nvtx",
+    "augmax",
+    "etils>=1.10.0",
+    "dm-tree>=0.1.8",
+    "einops>=0.8.0",
+    "equinox>=0.11.8",
+    "jaxtyping==0.2.36",
+    "ml_collections==1.0.0",
+    "numpydantic>=1.6.6",
+    "pydantic>=2,<3",
+    "pillow>=11.0.0",
+    "opencv-python>=4.10.0.84",
+    "datasets>=4.1.1",
+    "beartype==0.19.0",
+    "pynput>=1.7.7,<1.9.0",
+    "pyserial>=3.5,<4.0",
+    "rerun-sdk>=0.24.0,<0.27.0",
+    "treescope>=0.1.7",
+    "rich>=14.0.0",
+    "imageio>=2.36.1",
+    "fsspec[gcs]>=2024.6.0",
+    "filelock>=3.16.1",
+    "termcolor>=2.4.0,<4.0.0",
+    "tqdm-loggable>=0.2",
+    "tqdm>=4.67.1",
+    "msgpack>=1.0.5",
+    "tree>=0.2.4",
+    "wandb>=0.24.0,<0.25.0",
+    "websockets>=11.0",
+]
+thor-lerobot = [
+    "lerobot",
+]
+thor-fp8 = [
+    "nvidia-modelopt==0.33.1",
+    "onnxruntime>=1.24.4",
+]
+thor-test = [
+    "pytest>=8.3.4",
+]
+
+[tool.uv.sources]
+lerobot = { git = "https://github.com/huggingface/lerobot", tag = "v0.5.0" }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
