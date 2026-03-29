@@ -28,6 +28,8 @@ def _resolve_bundle(bundle_dir: str | Path, *, config_name: str) -> ArtifactBund
 
 
 def _candidate_onnx_path(bundle: ArtifactBundle, onnx_path: str | Path | None) -> Path:
+    """Resolve which ONNX artifact should be used for engine building."""
+
     if onnx_path is not None:
         return Path(onnx_path).expanduser().resolve()
     if bundle.precision and bundle.precision in bundle.onnx_paths:
@@ -45,6 +47,8 @@ def _onnx_input_names(onnx_path: Path) -> set[str]:
 
 
 def _shape_profiles(train_config: _config.TrainConfig, profile: EngineProfile) -> dict[str, tuple[str, str, str]]:
+    """Build TensorRT dynamic-shape profile strings for the exported ONNX inputs."""
+
     seq = (
         profile.min_seq_len or train_config.model.max_token_len,
         profile.opt_seq_len or train_config.model.max_token_len,
@@ -97,6 +101,8 @@ def _build_trtexec_command(
     engine_path: Path,
     profile: EngineProfile,
 ) -> list[str]:
+    """Construct the `trtexec` command used to build the TensorRT engine."""
+
     input_names = _onnx_input_names(onnx_path)
     shapes = _shape_profiles(train_config, profile)
     command = [
@@ -128,6 +134,8 @@ def build_engine(
     profile: EngineProfile = EngineProfile(),
     dry_run: bool = False,
 ) -> ArtifactBundle:
+    """Build a TensorRT engine from a bundle ONNX artifact and record the result."""
+
     train_config = _resolve_train_config(config)
     bundle = _resolve_bundle(bundle_dir, config_name=train_config.name)
     resolved_onnx_path = _candidate_onnx_path(bundle, onnx_path)

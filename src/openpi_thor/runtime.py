@@ -66,6 +66,8 @@ def _apply_state_dict_with_report(
     model: torch.nn.Module,
     state_dict: dict[str, torch.Tensor],
 ) -> CheckpointLoadReport:
+    """Load only shape-compatible weights and return a detailed load report."""
+
     model_state = model.state_dict()
     compatible_state: dict[str, torch.Tensor] = {}
     unexpected_keys: list[str] = []
@@ -141,6 +143,8 @@ def _build_policy(
     pytorch_device: str,
     default_prompt: str | None,
 ) -> _policy.Policy:
+    """Build the standard OpenPI policy wrapper around a PyTorch model."""
+
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     return _policy.Policy(
         model,
@@ -170,6 +174,8 @@ def load_pytorch_bundle(
     allow_compatibility_fallback: bool = False,
     pytorch_device: str | None = None,
 ) -> tuple[_policy.Policy, CheckpointLoadReport]:
+    """Load a converted PyTorch bundle as a normal OpenPI policy."""
+
     prepare_runtime()
     train_config = _resolve_train_config(config)
     bundle = _resolve_bundle(bundle_dir, config_name=train_config.name)
@@ -229,6 +235,8 @@ def _binding_dtypes(engine) -> dict[str, torch.dtype]:
 
 
 def _prepare_trt_inputs(observation: _model.Observation[torch.Tensor], *, device: str, dtypes: dict[str, torch.dtype]):
+    """Convert a policy observation into the flat TensorRT binding layout."""
+
     images = torch.cat([observation.images[key] for key in _model.IMAGE_KEYS], dim=1)
     img_masks = torch.stack([observation.image_masks[key] for key in _model.IMAGE_KEYS], dim=1)
     bindings = {
@@ -284,6 +292,8 @@ def _free_pytorch_submodules(model: torch.nn.Module) -> None:
 
 
 def _install_tensorrt_sample_actions(policy: _policy.Policy, engine) -> None:
+    """Replace the policy model's sampler with the TensorRT-backed sampler."""
+
     model = policy._model  # noqa: SLF001
     model.trt_engine = engine
     if not hasattr(model, "_original_sample_actions"):
@@ -305,6 +315,8 @@ def load_tensorrt_policy(
     allow_compatibility_fallback: bool = False,
     pytorch_device: str | None = None,
 ):
+    """Load a bundle as an OpenPI policy whose sampling path runs through TensorRT."""
+
     prepare_runtime()
     train_config = _resolve_train_config(config)
     bundle = _resolve_bundle(bundle_dir, config_name=train_config.name)

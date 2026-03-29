@@ -57,6 +57,8 @@ def _default_thresholds(
     *,
     candidate_path: str | Path | None = None,
 ) -> dict[str, float]:
+    """Choose default similarity/error thresholds for a validation run."""
+
     effective_precision = _artifact_precision_from_path(candidate_path, fallback=bundle.precision)
     if candidate_backend == "pytorch":
         return {"min_cosine": 0.999, "mean_abs_error": 0.01, "max_abs_error": 0.05}
@@ -100,6 +102,12 @@ def compare_backends(
     dataset_repo_id: str | None = None,
     dataset_root: str | Path | None = None,
 ) -> ValidationReport:
+    """Compare a PyTorch or TensorRT candidate against the JAX reference model.
+
+    The comparison uses fixed-noise inference on sampled dataset examples and
+    records the resulting report back into the bundle manifest and reports/.
+    """
+
     train_config = _resolve_train_config(config)
     bundle = _resolve_bundle(bundle_dir, config_name=train_config.name)
 

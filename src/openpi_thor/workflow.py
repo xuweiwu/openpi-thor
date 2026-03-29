@@ -33,6 +33,12 @@ def prepare_engine(
     dataset_repo_id: str | None = None,
     dataset_root: str | Path | None = None,
 ) -> ArtifactBundle:
+    """Run the standard export -> build -> optional validate workflow.
+
+    This is the high-level orchestration entrypoint used by the `prepare-engine`
+    CLI command. It keeps all generated artifacts inside one bundle directory.
+    """
+
     train_config = _resolve_train_config(config)
     bundle = export_to_onnx_bundle(
         train_config,
@@ -79,5 +85,7 @@ def prepare_engine(
 
 
 def bundle_status(bundle_dir: str | Path, *, verbose: bool = False) -> dict[str, Any]:
+    """Return a human-oriented summary of the bundle manifest and reports."""
+
     bundle = ArtifactBundle.load(bundle_dir)
     return bundle.status_dict(verbose=verbose)

@@ -25,6 +25,8 @@ class ValidationError(OpenPIThorError):
 
 @dataclasses.dataclass(frozen=True)
 class ShapeMismatch:
+    """Describe a checkpoint tensor whose shape does not match the live model."""
+
     key: str
     checkpoint_shape: tuple[int, ...]
     model_shape: tuple[int, ...]
@@ -47,6 +49,8 @@ class ShapeMismatch:
 
 @dataclasses.dataclass
 class CheckpointLoadReport:
+    """Summarize how safely a converted checkpoint loaded into the PyTorch model."""
+
     total_checkpoint_keys: int = 0
     loaded_keys: int = 0
     unexpected_keys: list[str] = dataclasses.field(default_factory=list)
@@ -85,6 +89,8 @@ class CheckpointLoadReport:
 
 @dataclasses.dataclass(frozen=True)
 class ExportOptions:
+    """User-facing options that shape ONNX export and optional quantization."""
+
     precision: str = "fp16"
     num_steps: int = 10
     enable_llm_nvfp4: bool = False
@@ -95,6 +101,8 @@ class ExportOptions:
 
 @dataclasses.dataclass(frozen=True)
 class EngineProfile:
+    """TensorRT build profile options shared across engine-building commands."""
+
     min_batch: int = 1
     opt_batch: int = 1
     max_batch: int = 1
@@ -107,6 +115,8 @@ class EngineProfile:
 
 @dataclasses.dataclass
 class ValidationReport:
+    """Numerical comparison summary for one backend-versus-JAX validation run."""
+
     reference_backend: str
     candidate_backend: str
     config_name: str
@@ -178,6 +188,8 @@ class ValidationReport:
 
 @dataclasses.dataclass
 class DoctorReport:
+    """Structured output from `openpi-thor doctor`."""
+
     passed: bool
     errors: list[str] = dataclasses.field(default_factory=list)
     warnings: list[str] = dataclasses.field(default_factory=list)
@@ -194,6 +206,12 @@ class DoctorReport:
 
 @dataclasses.dataclass
 class ArtifactRecord:
+    """Per-artifact state tracked inside a bundle manifest.
+
+    Each precision variant keeps its own ONNX path, engine paths, report files,
+    and validation summaries so phase outputs do not overwrite one another.
+    """
+
     key: str
     precision: str
     num_steps: int | None = None
@@ -249,6 +267,8 @@ class ArtifactRecord:
 
 @dataclasses.dataclass
 class ArtifactBundle:
+    """Thin manifest for one model bundle and its derived deployment artifacts."""
+
     bundle_dir: Path
     config_name: str
     source_checkpoint_dir: str | None = None
@@ -282,6 +302,8 @@ class ArtifactBundle:
         return self.bundle_dir / "reports"
 
     def ensure_artifact(self, key: str, *, precision: str | None = None) -> ArtifactRecord:
+        """Create or return the per-artifact record for a precision variant."""
+
         artifact = self.artifacts.get(key)
         if artifact is None:
             artifact = ArtifactRecord(key=key, precision=precision or key)
@@ -301,6 +323,8 @@ class ArtifactBundle:
         calibration_num_samples: int | None = None,
         export_options: Mapping[str, Any] | None = None,
     ) -> None:
+        """Record the ONNX path and export metadata for an artifact variant."""
+
         self.onnx_paths[key] = str(path)
         artifact = self.ensure_artifact(key, precision=precision or key)
         artifact.onnx_path = str(path)
@@ -321,6 +345,8 @@ class ArtifactBundle:
         artifact_key: str | None = None,
         recommended: bool = False,
     ) -> None:
+        """Record a built TensorRT engine and optionally mark it as recommended."""
+
         self.engine_paths[key] = str(path)
         if artifact_key is not None:
             artifact = self.ensure_artifact(artifact_key, precision=artifact_key)
@@ -337,6 +363,8 @@ class ArtifactBundle:
         *,
         artifact_key: str | None = None,
     ) -> None:
+        """Attach a validation report to the bundle and, optionally, one artifact variant."""
+
         self.validation_reports[key] = report
         if report.candidate_backend == "tensorrt" and report.candidate_path:
             engine_key = Path(report.candidate_path).stem
@@ -348,6 +376,8 @@ class ArtifactBundle:
                 artifact.engine_paths[Path(report.candidate_path).stem] = report.candidate_path
 
     def set_recommended_engine(self, path: str | Path | None, *, artifact_key: str | None = None) -> None:
+        """Mark one engine as the default serving target for this bundle."""
+
         self.recommended_engine = str(path) if path is not None else None
         if artifact_key is not None:
             artifact = self.ensure_artifact(artifact_key, precision=artifact_key)
@@ -361,6 +391,8 @@ class ArtifactBundle:
         artifact_key: str | None = None,
         report_key: str | None = None,
     ) -> Path:
+        """Write a detailed JSON phase report under reports/ and record its path."""
+
         self.report_dir.mkdir(parents=True, exist_ok=True)
         filename = _sanitize_report_name(name)
         path = self.report_dir / filename
@@ -387,6 +419,8 @@ class ArtifactBundle:
         return None
 
     def status_dict(self, *, verbose: bool = False) -> dict[str, Any]:
+        """Return a human-oriented summary of the bundle and per-artifact state."""
+
         artifacts: dict[str, Any] = {}
         keys = set(self.artifacts) | set(self.onnx_paths)
         for key in sorted(keys):
@@ -459,6 +493,8 @@ class ArtifactBundle:
         }
 
     def save(self) -> "ArtifactBundle":
+        """Persist the bundle manifest to `openpi_thor_bundle.json`."""
+
         self.bundle_dir.mkdir(parents=True, exist_ok=True)
         try:
             self.metadata_path.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True))
@@ -499,6 +535,8 @@ class ArtifactBundle:
 
     @classmethod
     def load(cls, bundle_dir: str | Path) -> "ArtifactBundle":
+        """Load a bundle manifest from disk and rebind it to the requested path."""
+
         bundle_path = Path(bundle_dir).expanduser().resolve()
         metadata_path = bundle_path / "openpi_thor_bundle.json"
         if not metadata_path.exists():
@@ -509,6 +547,8 @@ class ArtifactBundle:
 
 
 def default_bundle(bundle_dir: str | Path, config_name: str) -> ArtifactBundle:
+    """Create a new in-memory bundle manifest for a config and directory."""
+
     return ArtifactBundle(bundle_dir=Path(bundle_dir), config_name=config_name)
 
 
@@ -547,6 +587,8 @@ def _legacy_precision_from_name(name: str, fallback: str | None = None) -> str |
 
 
 def _migrate_legacy_bundle_artifacts(bundle: ArtifactBundle) -> None:
+    """Populate per-artifact records when loading an older single-manifest bundle."""
+
     for key, onnx_path in bundle.onnx_paths.items():
         calibration_source = None
         calibration_num_samples = None

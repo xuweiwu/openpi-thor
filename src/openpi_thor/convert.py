@@ -57,6 +57,12 @@ def inspect_jax_checkpoint(
     *,
     restore_precision: str | None = "float32",
 ) -> dict[str, list[int]]:
+    """Inspect a JAX checkpoint and return flattened parameter shapes.
+
+    This is a lightweight helper for sanity-checking the source checkpoint
+    before conversion without materializing a PyTorch bundle.
+    """
+
     checkpoint_dir = Path(checkpoint_dir).expanduser().resolve()
     params = _model.restore_params(
         checkpoint_dir / "params",
@@ -76,6 +82,12 @@ def convert_jax_checkpoint(
     copy_assets: bool = True,
     overwrite: bool = False,
 ) -> ArtifactBundle:
+    """Convert a JAX checkpoint into a PyTorch bundle directory.
+
+    The resulting bundle contains converted weights, copied assets when
+    available, and an updated manifest/report entry for the conversion phase.
+    """
+
     prepare_runtime()
     train_config = _resolve_train_config(config)
     checkpoint_dir = Path(checkpoint_dir).expanduser().resolve()

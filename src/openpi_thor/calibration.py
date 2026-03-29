@@ -92,6 +92,8 @@ def _decode_video_frames_pyav(
 
 
 def _patch_lerobot_video_decoder() -> None:
+    """Install a PyAV fallback when torchvision video decoding is unavailable."""
+
     if hasattr(torchvision.io, "VideoReader"):
         return
 
@@ -120,6 +122,8 @@ def sample_dataset_examples(
     dataset_repo_id: str | None = None,
     dataset_root: str | Path | None = None,
 ) -> list[dict[str, Any]]:
+    """Sample and repack real dataset examples for validation or calibration."""
+
     train_config = _resolve_train_config(config)
     _patch_lerobot_video_decoder()
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
@@ -222,6 +226,8 @@ def _prepare_policy_example(
 
 @dataclasses.dataclass
 class CalibrationBatches:
+    """Materialized calibration batches in the shape expected by ModelOpt."""
+
     batches: list[tuple[_model.Observation, torch.Tensor]]
 
     @property
@@ -236,6 +242,8 @@ class CalibrationBatches:
 
 
 class CalibrationSource(Protocol):
+    """Protocol for objects that can materialize calibration batches."""
+
     name: str
 
     def materialize(
@@ -250,6 +258,8 @@ class CalibrationSource(Protocol):
 
 @dataclasses.dataclass(frozen=True)
 class IterableCalibrationSource:
+    """Turn pre-built examples into calibration batches for a specific policy."""
+
     examples: Iterable[dict[str, Any]]
     name: str = "iterable"
 
@@ -272,6 +282,8 @@ class IterableCalibrationSource:
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotPi05CalibrationSource:
+    """Sample real LeRobot examples using the host OpenPI training config."""
+
     config: str | _config.TrainConfig
     num_samples: int = 32
     dataset_repo_id: str | None = None
@@ -300,6 +312,8 @@ class LeRobotPi05CalibrationSource:
 
 @dataclasses.dataclass(frozen=True)
 class DummyCalibrationSource:
+    """Generate synthetic calibration inputs for debugging only."""
+
     num_samples: int = 32
     seed: int = 0
     name: str = "dummy"
@@ -341,6 +355,8 @@ def build_calibration_batches(
     *,
     device: str | torch.device | None = None,
 ) -> CalibrationBatches:
+    """Materialize and validate calibration batches from a chosen source."""
+
     batches = calibration_source.materialize(policy, train_config, device=device)
     if len(batches) == 0:
         raise CalibrationError("Calibration source produced no batches.")

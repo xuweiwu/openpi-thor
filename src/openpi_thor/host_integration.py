@@ -45,6 +45,8 @@ REQUIRED_WORKSPACE_SOURCES = {
 
 @dataclasses.dataclass
 class HostPatchPlan:
+    """Result of checking or patching a host OpenPI repo for companion integration."""
+
     host_root: Path
     pyproject_path: Path
     changed: list[str] = dataclasses.field(default_factory=list)
@@ -261,6 +263,8 @@ def _validate_host_layout(host_root: Path, plan: HostPatchPlan) -> None:
 
 
 def plan_host_pyproject_patch(host_root: str | Path) -> HostPatchPlan:
+    """Preview the `pyproject.toml` edits required for companion-repo usage."""
+
     resolved_root = Path(host_root).expanduser().resolve()
     plan = HostPatchPlan(host_root=resolved_root, pyproject_path=resolved_root / "pyproject.toml")
     _validate_host_layout(resolved_root, plan)
@@ -301,6 +305,8 @@ def plan_host_pyproject_patch(host_root: str | Path) -> HostPatchPlan:
 
 
 def write_host_pyproject_patch(host_root: str | Path) -> HostPatchPlan:
+    """Apply the planned host `pyproject.toml` patch when it is safe to do so."""
+
     plan = plan_host_pyproject_patch(host_root)
     if not plan.can_write or plan.updated_text is None:
         return plan
@@ -310,6 +316,8 @@ def write_host_pyproject_patch(host_root: str | Path) -> HostPatchPlan:
 
 
 def companion_source_host_root(module_file: str | Path) -> Path | None:
+    """Infer the host repo root when openpi-thor is imported from source."""
+
     path = Path(module_file).resolve()
     if len(path.parents) < 3:
         return None
@@ -341,6 +349,8 @@ def companion_source_path_warning(module_file: str | Path) -> str | None:
 
 
 def doctor_host_integration_warnings(module_file: str | Path) -> tuple[dict[str, Any], list[str]]:
+    """Return companion-checkout metadata and any host integration warnings."""
+
     info: dict[str, Any] = {}
     warnings: list[str] = []
 

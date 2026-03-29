@@ -32,6 +32,13 @@ def _extract_trtexec_version(output: str) -> str | None:
 
 
 def _query_trtexec_version() -> tuple[bool, str]:
+    """Extract a TensorRT version string from `trtexec`.
+
+    Some Jetson AGX Thor builds print the version banner but return a non-zero
+    exit status for `trtexec --version`, so this helper also falls back to the
+    `--help` banner when necessary.
+    """
+
     last_output = ""
     for command in (["trtexec", "--version"], ["trtexec", "--help"]):
         ok, output = _command_output(command)
@@ -53,6 +60,8 @@ def _import_version(module_name: str) -> tuple[bool, str]:
 
 
 def run_doctor() -> DoctorReport:
+    """Inspect the current runtime and host checkout for common Thor issues."""
+
     errors: list[str] = []
     warnings: list[str] = []
     info: dict[str, object] = {}

@@ -19,6 +19,8 @@ def serve(
     default_prompt: str | None = None,
     pytorch_device: str | None = None,
 ) -> None:
+    """Start the websocket policy server backed by a TensorRT engine."""
+
     policy = load_tensorrt_policy(
         config,
         bundle_dir,

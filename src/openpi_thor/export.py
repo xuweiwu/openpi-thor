@@ -85,6 +85,8 @@ def _prefer_system_blackwell_ptxas() -> str | None:
 
 
 class QuantizedMatMul(torch.nn.Module):
+    """MatMul wrapper that lets ModelOpt attach quantizers to attention ops."""
+
     def __init__(self):
         super().__init__()
         self.input1_quantizer = None
@@ -166,6 +168,8 @@ def _create_observation_from_inputs(images, img_masks, state, lang_tokens, lang_
 
 
 def postprocess_onnx_model(onnx_path: str | Path, *, enable_llm_nvfp4: bool = False) -> None:
+    """Normalize exported ONNX artifacts and optionally rewrite NVFP4 QDQ nodes."""
+
     import onnx
     import onnx_graphsurgeon as gs
     from onnx.external_data_helper import convert_model_to_external_data
@@ -203,6 +207,8 @@ def postprocess_onnx_model(onnx_path: str | Path, *, enable_llm_nvfp4: bool = Fa
 
 
 class ONNXWrapper(torch.nn.Module):
+    """Wrap the policy sampler in a flat tensor-only interface for ONNX export."""
+
     def __init__(self, model: torch.nn.Module, num_steps: int):
         super().__init__()
         self.model = model
@@ -307,6 +313,8 @@ def prepare_model_for_export_precision(
 
 
 def patch_model_for_export(model: torch.nn.Module, *, compute_dtype: torch.dtype = torch.float16) -> torch.nn.Module:
+    """Patch the PyTorch sampler into an ONNX-export-friendly inference loop."""
+
     model.compute_dtype = compute_dtype
 
     vision_embeddings = model.paligemma_with_expert.paligemma.model.vision_tower.vision_model.embeddings
@@ -427,6 +435,8 @@ def quantize_model(
     enable_llm_nvfp4: bool,
     quantize_attention_matmul: bool,
 ) -> torch.nn.Module:
+    """Apply ModelOpt quantization to a patched PyTorch policy model."""
+
     if enable_llm_nvfp4:
         _prefer_system_blackwell_ptxas()
     import modelopt.torch.quantization as mtq
@@ -491,6 +501,8 @@ def export_to_onnx_bundle(
     dataset_repo_id: str | None = None,
     dataset_root: str | Path | None = None,
 ) -> ArtifactBundle:
+    """Export a bundle to ONNX and record the resulting artifact metadata."""
+
     import onnx
 
     prepare_runtime()
