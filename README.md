@@ -81,6 +81,25 @@ package is:
   explicit FP32 stability islands in Gemma-based models, such as RMSNorm, and avoids the
   large numerical drift seen with weakly typed builds on Jetson AGX Thor.
 
+## Acknowledgements
+
+This package builds on the official Jetson AI Lab OpenPI-on-Thor tutorial:
+
+- https://www.jetson-ai-lab.com/tutorials/openpi_on_thor/
+
+In particular:
+
+- `src/openpi_thor/trt_torch.py` re-homes the tutorial's `trt_torch.py` helper so
+  `openpi-thor` can serve TensorRT engines without depending on an `openpi_on_thor/`
+  directory at runtime
+- parts of the ONNX/TensorRT compatibility flow were developed with the tutorial scripts as a
+  reference, then adapted for the companion-package workflow and user-finetuned `pi05_*`
+  models
+
+## License
+
+`openpi-thor` is licensed under Apache License 2.0. See `LICENSE`.
+
 ## Repo-level `pyproject.toml` changes
 
 `openpi-thor` is a workspace package, so a few root-level `uv` settings in the host repo's
@@ -98,6 +117,20 @@ package is:
 
 You usually do not need to edit those entries by hand, but they are part of why the setup
 steps below work reliably.
+
+## Acknowledgements
+
+`openpi-thor` builds on the official Jetson AI Lab OpenPI-on-Thor tutorial:
+
+- https://www.jetson-ai-lab.com/tutorials/openpi_on_thor/
+
+In particular:
+
+- the local TensorRT helper in `src/openpi_thor/trt_torch.py` was re-homed from the tutorial's
+  `trt_torch.py` so this package no longer needs the tutorial directory at runtime
+- parts of the ONNX/TensorRT compatibility work were developed with the tutorial scripts as a
+  reference, then adapted for a companion-package workflow and user-finetuned `pi05_*` models
+  inside upstream-like `openpi` forks
 
 ## Using `openpi-thor` from another `openpi` fork
 
