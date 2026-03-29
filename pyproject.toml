@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Thor-native OpenPI deployment utilities for conversion, export, validation, and TensorRT serving"
 readme = "README.md"
 requires-python = ">=3.11"
+license = { file = "LICENSE" }
 dependencies = [
     "openpi",
     "openpi-client",
