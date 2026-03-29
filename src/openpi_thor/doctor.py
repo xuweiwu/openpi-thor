@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -14,10 +15,33 @@ from openpi_thor.host_integration import doctor_host_integration_warnings
 
 def _command_output(command: list[str]) -> tuple[bool, str]:
     try:
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)
-    return True, (result.stdout or result.stderr).strip()
+    output = (result.stdout or result.stderr).strip()
+    if result.returncode != 0:
+        return False, output or f"Command {command!r} exited with status {result.returncode}."
+    return True, output
+
+
+def _extract_trtexec_version(output: str) -> str | None:
+    match = re.search(r"TensorRT\.trtexec \[TensorRT ([^\]]+)\]", output)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _query_trtexec_version() -> tuple[bool, str]:
+    last_output = ""
+    for command in (["trtexec", "--version"], ["trtexec", "--help"]):
+        ok, output = _command_output(command)
+        last_output = output
+        version = _extract_trtexec_version(output)
+        if version is not None:
+            return True, version
+        if ok and output:
+            return True, output.splitlines()[0].strip()
+    return False, last_output
 
 
 def _import_version(module_name: str) -> tuple[bool, str]:
@@ -41,7 +65,7 @@ def run_doctor() -> DoctorReport:
     if shutil.which("trtexec") is None:
         errors.append("trtexec is not on PATH.")
     else:
-        ok, output = _command_output(["trtexec", "--version"])
+        ok, output = _query_trtexec_version()
         if ok:
             info["trtexec_version"] = output
         else:
