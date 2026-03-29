@@ -172,6 +172,9 @@ separate JSON files under `reports/`.
 
 ## Main commands
 
+Use `openpi-thor -h` to list commands, or `openpi-thor <command> -h` / `--help` to show
+all arguments for one command.
+
 - `openpi-thor doctor`
   Checks whether the Jetson AGX Thor runtime has the required Python packages and host tools.
 - `openpi-thor convert-jax`
