@@ -51,7 +51,32 @@ line-length = 88
     assert "line-length = 88" in plan.updated_text
     assert 'override-dependencies = ["existing==1.0", "ml-dtypes==0.5.1", "tensorstore==0.1.74"]' in plan.updated_text
     assert 'openpi = { workspace = true }' in plan.updated_text
+    assert 'openpi-client = { workspace = true }' in plan.updated_text
     assert 'lerobot = { git = "https://github.com/huggingface/lerobot", tag = "v0.5.0" }' in plan.updated_text
+
+
+def test_host_patch_replaces_old_ml_dtypes_pin(tmp_path: Path) -> None:
+    host_root = _make_host_repo(
+        tmp_path,
+        """
+[project]
+name = "openpi"
+version = "0.1.0"
+
+[tool.uv]
+override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
+
+[tool.uv.workspace]
+members = ["packages/*"]
+""".strip()
+        + "\n",
+    )
+
+    plan = plan_host_pyproject_patch(host_root)
+
+    assert plan.updated_text is not None
+    assert 'ml-dtypes==0.4.1' not in plan.updated_text
+    assert 'override-dependencies = ["ml-dtypes==0.5.1", "tensorstore==0.1.74"]' in plan.updated_text
 
 
 def test_host_patch_write_is_idempotent(tmp_path: Path) -> None:

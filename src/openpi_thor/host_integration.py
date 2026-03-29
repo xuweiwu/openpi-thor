@@ -37,6 +37,10 @@ REQUIRED_LEROBOT_SOURCE = {
     "git": "https://github.com/huggingface/lerobot",
     "tag": "v0.5.0",
 }
+REQUIRED_WORKSPACE_SOURCES = {
+    "openpi": {"workspace": True},
+    "openpi-client": {"workspace": True},
+}
 
 
 @dataclasses.dataclass
@@ -161,14 +165,35 @@ def _replace_or_insert_section(
 
 
 def _merged_override_dependencies(existing: list[str], plan: HostPatchPlan) -> list[str]:
-    merged = list(existing)
-    missing = [item for item in REQUIRED_OVERRIDE_DEPENDENCIES if item not in merged]
-    if missing:
-        merged.extend(missing)
+    merged: list[str] = []
+    required_by_name = {item.split("==", 1)[0]: item for item in REQUIRED_OVERRIDE_DEPENDENCIES}
+    replaced: list[str] = []
+    seen_names: set[str] = set()
+
+    for item in existing:
+        name = item.split("==", 1)[0]
+        if name in seen_names:
+            continue
+        if name in required_by_name:
+            required = required_by_name.pop(name)
+            if item != required:
+                replaced.append(f"{item} -> {required}")
+            merged.append(required)
+            seen_names.add(name)
+            continue
+        merged.append(item)
+        seen_names.add(name)
+
+    if required_by_name:
+        merged.extend(required_by_name.values())
         plan.changed.append(
-            "Added required tool.uv.override-dependencies entries: " + ", ".join(missing)
+            "Added required tool.uv.override-dependencies entries: " + ", ".join(required_by_name.values())
         )
-    else:
+    if replaced:
+        plan.changed.append(
+            "Updated tool.uv.override-dependencies entries: " + ", ".join(replaced)
+        )
+    if not required_by_name and not replaced:
         plan.already_correct.append("tool.uv.override-dependencies already contains the required pins")
     return merged
 
@@ -193,6 +218,17 @@ def _merged_conflicts(existing: list[Any], plan: HostPatchPlan) -> list[Any]:
 
 def _merged_sources(existing: Mapping[str, Any], plan: HostPatchPlan) -> dict[str, Any]:
     merged = dict(existing)
+    for name, required in REQUIRED_WORKSPACE_SOURCES.items():
+        current = merged.get(name)
+        if current != required:
+            merged[name] = dict(required)
+            if current is None:
+                plan.changed.append(f"Added tool.uv.sources.{name} = workspace source")
+            else:
+                plan.changed.append(f"Updated tool.uv.sources.{name} to a workspace source")
+        else:
+            plan.already_correct.append(f"tool.uv.sources.{name} already points at the workspace member")
+
     current = merged.get("lerobot")
     if current != REQUIRED_LEROBOT_SOURCE:
         merged["lerobot"] = dict(REQUIRED_LEROBOT_SOURCE)
