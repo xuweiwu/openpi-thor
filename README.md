@@ -23,6 +23,15 @@ If you intentionally do not install the console script into the runtime venv, th
 python -m openpi_thor.cli ...
 ```
 
+## Before you start
+
+`openpi-thor` assumes:
+
+- a Jetson AGX Thor host with JetPack-managed CUDA and TensorRT
+- an upstream-like local `openpi` checkout
+- TensorRT Python bindings and `trtexec` provided by the host runtime
+- a dedicated Jetson AGX Thor runtime venv for real export, build, validation, and serving work
+
 ## Quick start
 
 If you already have an `openpi` checkout on Jetson AGX Thor, this is the shortest path to a
@@ -178,14 +187,6 @@ openpi-thor serve \
 
 Replace `<PI05_TRAIN_CONFIG>` with the config name registered in your host `openpi` fork.
 
-## What `openpi-thor` assumes
-
-- Jetson AGX Thor host with JetPack-managed CUDA and TensorRT
-- an upstream-like local `openpi` checkout
-- TensorRT Python bindings and `trtexec` provided by the host runtime
-- real export/build/serve work happens in a dedicated Jetson AGX Thor runtime venv, not the
-  repo's default dev environment
-
 ## Bundle directories
 
 A bundle directory is the working directory for one model across the whole deployment flow.
@@ -205,10 +206,16 @@ Typical contents:
 `openpi_thor_bundle.json` is the thin manifest. Detailed phase outputs are written into
 separate JSON files under `reports/`.
 
-## Main commands
+The remaining sections are reference material. Most first-time users can ignore them until they
+need a deeper explanation or a different workflow.
+
+<details>
+<summary>Command reference and common workflows</summary>
 
 Use `openpi-thor -h` to list commands, or `openpi-thor <command> -h` / `--help` to show
 all arguments for one command.
+
+### Main commands
 
 - `openpi-thor doctor`
   Checks whether the Jetson AGX Thor runtime has the required Python packages and host tools.
@@ -229,8 +236,6 @@ all arguments for one command.
   Prints a compact summary of bundle contents, recommended engine, validation state, and report files.
 - `openpi-thor serve`
   Starts the websocket inference server for the selected or recommended engine.
-
-## Common workflows
 
 ### Build FP16 first
 
@@ -297,7 +302,24 @@ engine, which is normally the validated `fp16` engine.
 Normally `serve` uses the recommended engine recorded in the bundle. Use `--engine-path` only
 for A/B tests or debugging.
 
-## Why these defaults exist
+### Validation thresholds and the serving gate
+
+`validate` and `validate-tensorrt` always write a report, but `serve` treats fp8-style engines
+more strictly: an fp8 or fp8+nvfp4 engine must have a passing validation report for that exact
+artifact unless you explicitly override the safety gate with `--no-require-validated`.
+
+Default pass/fail thresholds are currently:
+
+- PyTorch vs JAX: `min_cosine >= 0.999`, `mean_abs_error <= 0.01`, `max_abs_error <= 0.05`
+- TensorRT fp16 vs JAX: `min_cosine >= 0.995`, `mean_abs_error <= 0.03`, `max_abs_error <= 0.12`
+- Any comparison that involves `fp8` or `fp8+nvfp4`: `min_cosine >= 0.97`, `mean_abs_error <= 0.08`, `max_abs_error <= 0.3`
+
+So a validation report can exist and still block serving if it did not pass those thresholds.
+
+</details>
+
+<details>
+<summary>Why these defaults exist</summary>
 
 Two design choices in `openpi-thor` are deliberate departures from a naive “export everything in
 fp16” or “turn on broad NVFP4 everywhere” approach.
@@ -334,7 +356,10 @@ That narrower path brought the TensorRT result back into the same accuracy regim
 the tested Jetson AGX Thor stack when compared against both JAX and the reference fp16 TensorRT
 engine.
 
-## Companion-repo integration details
+</details>
+
+<details>
+<summary>Companion-repo integration details</summary>
 
 The supported v1 companion-repo model assumes:
 
@@ -394,7 +419,10 @@ except ImportError:
 - if you apply the `PromptFromLeRobotTask` fallback manually, also make sure `Any` is imported
   from `typing`
 
-## Tested host and dependency matrix
+</details>
+
+<details>
+<summary>Tested host and dependency matrix</summary>
 
 The package is intended to be portable across Jetson AGX Thor setups, but the current flow was
 tested on:
@@ -440,7 +468,10 @@ Important notes:
 - FP8 calibration defaults to `32` real samples. Use `128` or `256` only for slower calibration
   sweeps and comparison experiments.
 
-## Troubleshooting
+</details>
+
+<details>
+<summary>Troubleshooting</summary>
 
 - If `torch.cuda.is_available()` becomes `False` after an install step, re-assert the tested
   Jetson AGX Thor PyTorch group.
@@ -452,11 +483,19 @@ Important notes:
   tools are all present in the Jetson AGX Thor runtime.
 - If you keep a backup of this repo, do not leave another `openpi-thor` checkout under
   `packages/`, because `uv` will see duplicate workspace members with the same package name.
+- `Norm stats not found in ... , skipping.` usually means the host OpenPI config probed one
+  assets directory first and then fell back to another path. That message is only a problem if no
+  later `Loaded norm stats from ...` line appears.
+- `JAX version ... available.` during TensorRT serving is an import-time info message from the
+  Python stack, typically Hugging Face `datasets` detecting that JAX is installed. It does not
+  mean the served policy is using JAX for inference.
 - Use the repo dev environment for unit tests, not the Jetson AGX Thor runtime venv:
 
 ```bash
 uv run --package openpi-thor pytest packages/openpi-thor/tests -m "not manual"
 ```
+
+</details>
 
 ## Acknowledgements
 
@@ -471,7 +510,3 @@ In particular:
   directory at runtime
 - parts of the ONNX/TensorRT compatibility flow were developed with the tutorial scripts as a
   reference, then adapted for the companion-package workflow and user-finetuned `pi05_*` models
-
-## License
-
-`openpi-thor` is licensed under Apache License 2.0. See `LICENSE`.
