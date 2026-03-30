@@ -41,6 +41,87 @@ REQUIRED_WORKSPACE_SOURCES = {
     "openpi": {"workspace": True},
     "openpi-client": {"workspace": True},
 }
+HOST_LEROBOT_COMPATIBILITY_FILE = Path("src/openpi/training/data_loader.py")
+HOST_TRANSFORMS_COMPATIBILITY_FILE = Path("src/openpi/transforms.py")
+OLD_LEROBOT_IMPORT = "import lerobot.common.datasets.lerobot_dataset as lerobot_dataset"
+NEW_LEROBOT_IMPORT = "import lerobot.datasets.lerobot_dataset as lerobot_dataset"
+COMPAT_LEROBOT_IMPORT_BLOCK = "\n".join(
+    (
+        "try:",
+        f"    {NEW_LEROBOT_IMPORT}",
+        "except ImportError:",
+        f"    {OLD_LEROBOT_IMPORT}",
+    )
+)
+OLD_PROMPT_FROM_TASK_BLOCK = "\n".join(
+    (
+        "@dataclasses.dataclass(frozen=True)",
+        "class PromptFromLeRobotTask(DataTransformFn):",
+        '    """Extracts a prompt from the current LeRobot dataset task."""',
+        "",
+        "    # Contains the LeRobot dataset tasks (dataset.meta.tasks).",
+        "    tasks: dict[int, str]",
+        "",
+        "    def __call__(self, data: DataDict) -> DataDict:",
+        '        if "task_index" not in data:',
+        '            raise ValueError(\'Cannot extract prompt without "task_index"\')',
+        "",
+        '        task_index = int(data["task_index"])',
+        "        if (prompt := self.tasks.get(task_index)) is None:",
+        '            raise ValueError(f"{task_index=} not found in task mapping: {self.tasks}")',
+        "",
+        '        return {**data, "prompt": prompt}',
+    )
+)
+COMPAT_PROMPT_FROM_TASK_BLOCK = "\n".join(
+    (
+        "@dataclasses.dataclass(frozen=True)",
+        "class PromptFromLeRobotTask(DataTransformFn):",
+        '    """Extracts a prompt from the current LeRobot dataset task."""',
+        "",
+        "    # Contains the LeRobot dataset tasks (dataset.meta.tasks).",
+        "    # In practice this can be a dict or a pandas.DataFrame",
+        "    tasks: Any",
+        "",
+        "    def __call__(self, data: DataDict) -> DataDict:",
+        '        if "task_index" not in data:',
+        '            raise ValueError(\'Cannot extract prompt without "task_index"\')',
+        "",
+        '        task_index = int(data["task_index"])',
+        "",
+        "        # LerobotDataset v2: dict[int, str]",
+        "        if isinstance(self.tasks, dict):",
+        "            prompt = self.tasks.get(task_index)",
+        "            if prompt is None:",
+        '                raise ValueError(f"{task_index=} not found in task mapping: {self.tasks}")',
+        '            return {**data, "prompt": prompt}',
+        "",
+        "        # LerobotDataset v3: pandas.DataFrame",
+        "        # tasks.parquet -> DataFrame with e.g.:",
+        "        #   index: prompt (string)",
+        "        #   column: 'task_index' (int)",
+        '        if hasattr(self.tasks, "columns") and "task_index" in getattr(self.tasks, "columns", []):',
+        "            # Find row(s) whose task_index matches the sample",
+        '            rows = self.tasks[self.tasks["task_index"] == task_index]',
+        "            if rows.empty:",
+        '                raise ValueError(f"{task_index=} not found in task mapping:\\n{self.tasks}")',
+        "",
+        "            # The index of the row is the prompt string",
+        "            prompt = str(rows.index[0])",
+        '            return {**data, "prompt": prompt}',
+        "",
+        "        # Fallback: list-like or unknown type",
+        "        try:",
+        "            prompt = self.tasks[task_index]",
+        "        except Exception as e:",
+        '            raise ValueError(',
+        '                f"Unsupported type for tasks={type(self.tasks)}; cannot extract prompt for {task_index=}"',
+        "            ) from e",
+        "",
+        '        return {**data, "prompt": prompt}',
+    )
+)
+TRANSFORMS_ANY_IMPORT_PATTERN = re.compile(r"(?m)^from typing import (?P<imports>.+)$")
 
 
 @dataclasses.dataclass
@@ -54,10 +135,11 @@ class HostPatchPlan:
     could_not_patch: list[str] = dataclasses.field(default_factory=list)
     errors: list[str] = dataclasses.field(default_factory=list)
     updated_text: str | None = None
+    extra_file_updates: dict[Path, str] = dataclasses.field(default_factory=dict)
 
     @property
     def can_write(self) -> bool:
-        return not self.errors and self.updated_text is not None
+        return not self.errors and (self.updated_text is not None or bool(self.extra_file_updates))
 
 
 def _normalize_conflict(conflict: Any) -> tuple[tuple[tuple[str, str], ...], ...]:
@@ -262,8 +344,120 @@ def _validate_host_layout(host_root: Path, plan: HostPatchPlan) -> None:
             )
 
 
-def plan_host_pyproject_patch(host_root: str | Path) -> HostPatchPlan:
-    """Preview the `pyproject.toml` edits required for companion-repo usage."""
+def _plan_lerobot_compatibility_patch(host_root: Path, plan: HostPatchPlan) -> dict[Path, str]:
+    """Plan the host source patch that keeps OpenPI compatible with newer LeRobot tags."""
+
+    source_path = host_root / HOST_LEROBOT_COMPATIBILITY_FILE
+    if not source_path.exists():
+        plan.could_not_patch.append(
+            f"Expected {HOST_LEROBOT_COMPATIBILITY_FILE.as_posix()} to exist for the LeRobot compatibility check."
+        )
+        return {}
+
+    source_text = source_path.read_text()
+    if COMPAT_LEROBOT_IMPORT_BLOCK in source_text:
+        plan.already_correct.append(
+            f"{HOST_LEROBOT_COMPATIBILITY_FILE.as_posix()} already supports both old and new LeRobot import paths"
+        )
+        return {}
+    if re.search(r"(?m)^import lerobot\.datasets\.lerobot_dataset as lerobot_dataset$", source_text):
+        plan.already_correct.append(
+            f"{HOST_LEROBOT_COMPATIBILITY_FILE.as_posix()} already supports newer LeRobot versions"
+        )
+        return {}
+
+    updated_text, replacements = re.subn(
+        r"(?m)^import lerobot\.common\.datasets\.lerobot_dataset as lerobot_dataset$",
+        COMPAT_LEROBOT_IMPORT_BLOCK,
+        source_text,
+        count=1,
+    )
+    if replacements != 1:
+        plan.could_not_patch.append(
+            "Could not locate the known legacy LeRobot import in "
+            f"{HOST_LEROBOT_COMPATIBILITY_FILE.as_posix()}; patch it manually if your host repo still targets "
+            "older upstream OpenPI."
+        )
+        return {}
+
+    plan.changed.append(
+        "Patched "
+        f"{HOST_LEROBOT_COMPATIBILITY_FILE.as_posix()} to support both legacy and newer LeRobot import paths"
+    )
+    return {source_path: updated_text}
+
+
+def _plan_prompt_transform_compatibility_patch(host_root: Path, plan: HostPatchPlan) -> dict[Path, str]:
+    """Plan the host transform patch that keeps PromptFromLeRobotTask compatible with newer LeRobot metadata."""
+
+    source_path = host_root / HOST_TRANSFORMS_COMPATIBILITY_FILE
+    if not source_path.exists():
+        plan.could_not_patch.append(
+            f"Expected {HOST_TRANSFORMS_COMPATIBILITY_FILE.as_posix()} to exist for the LeRobot task transform check."
+        )
+        return {}
+
+    source_text = source_path.read_text()
+    has_any_import = re.search(r"(?m)^from typing import .*\bAny\b", source_text) is not None
+    has_new_prompt_logic = "# LerobotDataset v3: pandas.DataFrame" in source_text
+
+    if has_new_prompt_logic and has_any_import:
+        plan.already_correct.append(
+            f"{HOST_TRANSFORMS_COMPATIBILITY_FILE.as_posix()} already supports both dict and DataFrame LeRobot task metadata"
+        )
+        return {}
+
+    updated_text = source_text
+    changed = False
+
+    if not has_new_prompt_logic:
+        if OLD_PROMPT_FROM_TASK_BLOCK not in source_text:
+            plan.could_not_patch.append(
+                "Could not locate the known legacy PromptFromLeRobotTask implementation in "
+                f"{HOST_TRANSFORMS_COMPATIBILITY_FILE.as_posix()}; patch it manually if your host repo still targets "
+                "older upstream OpenPI."
+            )
+            return {}
+        updated_text = updated_text.replace(OLD_PROMPT_FROM_TASK_BLOCK, COMPAT_PROMPT_FROM_TASK_BLOCK, 1)
+        plan.changed.append(
+            "Patched "
+            f"{HOST_TRANSFORMS_COMPATIBILITY_FILE.as_posix()} so PromptFromLeRobotTask supports newer LeRobot task metadata"
+        )
+        changed = True
+
+    if not has_any_import:
+        def _add_any_import(match: re.Match[str]) -> str:
+            imports = [item.strip() for item in match.group("imports").split(",")]
+            if "Any" in imports:
+                return match.group(0)
+            return "from typing import Any, " + ", ".join(imports)
+
+        updated_text, replacements = TRANSFORMS_ANY_IMPORT_PATTERN.subn(_add_any_import, updated_text, count=1)
+        if replacements != 1:
+            plan.could_not_patch.append(
+                "Could not locate the host typing import line needed to add `Any` in "
+                f"{HOST_TRANSFORMS_COMPATIBILITY_FILE.as_posix()}."
+            )
+            return {}
+        plan.changed.append(f"Added `Any` to the typing imports in {HOST_TRANSFORMS_COMPATIBILITY_FILE.as_posix()}")
+        changed = True
+
+    if not changed:
+        plan.already_correct.append(
+            f"{HOST_TRANSFORMS_COMPATIBILITY_FILE.as_posix()} already supports newer LeRobot task metadata"
+        )
+        return {}
+
+    if updated_text == source_text:
+        plan.could_not_patch.append(
+            f"No changes were produced for {HOST_TRANSFORMS_COMPATIBILITY_FILE.as_posix()} despite the compatibility check."
+        )
+        return {}
+    return {source_path: updated_text}
+
+
+def plan_host_integration_patch(host_root: str | Path) -> HostPatchPlan:
+    """Preview the host-repo edits required for companion-repo usage."""
 
     resolved_root = Path(host_root).expanduser().resolve()
     plan = HostPatchPlan(host_root=resolved_root, pyproject_path=resolved_root / "pyproject.toml")
@@ -301,18 +495,37 @@ def plan_host_pyproject_patch(host_root: str | Path) -> HostPatchPlan:
         after_section="tool.uv",
     )
     plan.updated_text = updated_text
+    extra_updates: dict[Path, str] = {}
+    extra_updates.update(_plan_lerobot_compatibility_patch(resolved_root, plan))
+    extra_updates.update(_plan_prompt_transform_compatibility_patch(resolved_root, plan))
+    plan.extra_file_updates = extra_updates
     return plan
+
+
+def write_host_integration_patch(host_root: str | Path) -> HostPatchPlan:
+    """Apply the planned host integration patch when it is safe to do so."""
+
+    plan = plan_host_integration_patch(host_root)
+    if not plan.can_write:
+        return plan
+    if plan.updated_text is not None and plan.pyproject_path.read_text() != plan.updated_text:
+        plan.pyproject_path.write_text(plan.updated_text)
+    for path, text in plan.extra_file_updates.items():
+        if path.read_text() != text:
+            path.write_text(text)
+    return plan
+
+
+def plan_host_pyproject_patch(host_root: str | Path) -> HostPatchPlan:
+    """Backward-compatible alias for the broader host integration preview."""
+
+    return plan_host_integration_patch(host_root)
 
 
 def write_host_pyproject_patch(host_root: str | Path) -> HostPatchPlan:
-    """Apply the planned host `pyproject.toml` patch when it is safe to do so."""
+    """Backward-compatible alias for the broader host integration patch."""
 
-    plan = plan_host_pyproject_patch(host_root)
-    if not plan.can_write or plan.updated_text is None:
-        return plan
-    if plan.pyproject_path.read_text() != plan.updated_text:
-        plan.pyproject_path.write_text(plan.updated_text)
-    return plan
+    return write_host_integration_patch(host_root)
 
 
 def companion_source_host_root(module_file: str | Path) -> Path | None:
@@ -365,7 +578,7 @@ def doctor_host_integration_warnings(module_file: str | Path) -> tuple[dict[str,
     info["companion_host_root"] = str(host_root)
     info["companion_checkout"] = SUPPORTED_COMPANION_CHECKOUT.as_posix()
 
-    plan = plan_host_pyproject_patch(host_root)
+    plan = plan_host_integration_patch(host_root)
     if plan.errors:
         warnings.extend(f"Host integration check: {message}" for message in plan.errors)
         return info, warnings
@@ -373,7 +586,7 @@ def doctor_host_integration_warnings(module_file: str | Path) -> tuple[dict[str,
     if plan.changed:
         info["companion_host_changes_needed"] = list(plan.changed)
         warnings.append(
-            "Host pyproject.toml is missing some openpi-thor companion settings. "
+            "Host repo is missing some openpi-thor companion settings. "
             "Run `python packages/openpi-thor/scripts/patch_host_openpi.py --host-root . --write`."
         )
     else:
