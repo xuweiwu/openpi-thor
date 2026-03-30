@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 from pathlib import Path
@@ -9,6 +10,8 @@ from openpi.training import config as _config
 
 from openpi_thor._schema import ArtifactBundle
 from openpi_thor._schema import EngineProfile
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_train_config(config: str | _config.TrainConfig) -> _config.TrainConfig:
@@ -143,10 +146,20 @@ def build_engine(
     engine_dir.mkdir(parents=True, exist_ok=True)
     engine_path = engine_dir / f"{resolved_onnx_path.stem}.engine"
     command = _build_trtexec_command(train_config, bundle, resolved_onnx_path, engine_path, profile)
+    logger.info("Building TensorRT engine from %s", resolved_onnx_path)
+    logger.info(
+        "Selected engine output %s (strongly_typed=%s)",
+        engine_path,
+        profile.strongly_typed,
+    )
     if not dry_run:
         if shutil.which("trtexec") is None:
             raise FileNotFoundError("trtexec was not found on PATH.")
+        logger.info("Running trtexec; this may take several minutes on Jetson AGX Thor")
         subprocess.run(command, check=True)
+        logger.info("Built TensorRT engine %s", engine_path)
+    else:
+        logger.info("Dry run: recorded trtexec command without building the engine")
     artifact_key = _artifact_precision_from_path(resolved_onnx_path, fallback=bundle.precision) or resolved_onnx_path.stem
     bundle.set_engine_path(resolved_onnx_path.stem, engine_path, artifact_key=artifact_key)
     bundle.write_report(
@@ -174,4 +187,5 @@ def build_engine(
         report_key=f"build:{resolved_onnx_path.stem}",
     )
     bundle.save()
+    logger.info("Updated bundle manifest %s", bundle.metadata_path)
     return bundle

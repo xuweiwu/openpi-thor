@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,8 @@ from openpi_thor._schema import ExportOptions
 from openpi_thor.engine import build_engine
 from openpi_thor.export import export_to_onnx_bundle
 from openpi_thor.validate import compare_backends
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_train_config(config: str | _config.TrainConfig) -> _config.TrainConfig:
@@ -40,6 +43,13 @@ def prepare_engine(
     """
 
     train_config = _resolve_train_config(config)
+    logger.info(
+        "Preparing engine workflow: config=%s bundle=%s precision=%s",
+        train_config.name,
+        Path(bundle_dir).expanduser().resolve(),
+        export_options.precision,
+    )
+    logger.info("Step 1/3: export ONNX")
     bundle = export_to_onnx_bundle(
         train_config,
         bundle_dir,
@@ -51,6 +61,7 @@ def prepare_engine(
     )
     artifact_key = bundle.precision or export_options.precision.lower()
     onnx_path = bundle.onnx_paths[artifact_key]
+    logger.info("Step 2/3: build TensorRT engine")
     bundle = build_engine(
         train_config,
         bundle.bundle_dir,
@@ -61,6 +72,7 @@ def prepare_engine(
     engine_key = Path(onnx_path).stem
     engine_path = Path(bundle.engine_paths[engine_key])
     if validate:
+        logger.info("Step 3/3: validate TensorRT output against JAX")
         report = compare_backends(
             train_config,
             bundle.bundle_dir,
@@ -77,10 +89,15 @@ def prepare_engine(
             bundle = ArtifactBundle.load(bundle.bundle_dir)
             bundle.set_recommended_engine(engine_path, artifact_key=artifact_key)
             bundle.save()
+            logger.info("Validation passed; marked %s as the recommended engine", engine_path)
+        else:
+            logger.info("Validation did not pass; the recommended engine remains unchanged")
     elif artifact_key == "fp16" and bundle.get_recommended_engine_path() is None:
         bundle.set_recommended_engine(engine_path, artifact_key=artifact_key)
         bundle.save()
+        logger.info("Marked %s as the default recommended FP16 engine", engine_path)
 
+    logger.info("Finished prepare-engine for %s", bundle.bundle_dir)
     return bundle
 
 

@@ -4,6 +4,7 @@ from collections.abc import Iterable
 import copy
 import dataclasses
 import importlib.util
+import logging
 from pathlib import Path
 from typing import Any
 from typing import Protocol
@@ -21,6 +22,8 @@ from openpi.training import data_loader as _data_loader
 import openpi.transforms as _transforms
 
 from openpi_thor._schema import CalibrationError
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_train_config(config: str | _config.TrainConfig) -> _config.TrainConfig:
@@ -129,6 +132,13 @@ def sample_dataset_examples(
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if dataset_repo_id is not None:
         data_config = dataclasses.replace(data_config, repo_id=dataset_repo_id)
+    logger.info(
+        "Sampling %d real dataset example(s) from %s",
+        num_examples,
+        data_config.repo_id,
+    )
+    if dataset_root is not None:
+        logger.info("Using local LeRobot dataset root %s", Path(dataset_root).expanduser().resolve())
     dataset = _create_dataset_for_sampling(
         data_config,
         action_horizon=train_config.model.action_horizon,
@@ -357,7 +367,9 @@ def build_calibration_batches(
 ) -> CalibrationBatches:
     """Materialize and validate calibration batches from a chosen source."""
 
+    logger.info("Materializing calibration batches from source=%s", calibration_source.name)
     batches = calibration_source.materialize(policy, train_config, device=device)
     if len(batches) == 0:
         raise CalibrationError("Calibration source produced no batches.")
+    logger.info("Prepared %d calibration batch(es)", len(batches))
     return batches

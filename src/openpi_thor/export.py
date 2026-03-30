@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 import contextlib
 import dataclasses
+import logging
 import os
 from pathlib import Path
 import re
@@ -25,6 +26,8 @@ from openpi_thor.calibration import build_calibration_batches
 from openpi_thor.calibration import CalibrationSource
 from openpi_thor.compat import prepare_runtime
 from openpi_thor.runtime import load_pytorch_bundle
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_train_config(config: str | _config.TrainConfig) -> _config.TrainConfig:
@@ -574,6 +577,11 @@ def quantize_model(
 
     if enable_llm_nvfp4:
         quant_cfg = _apply_nvfp4_gemma_mlp_weight_only_quant_cfg(quant_cfg)
+        logger.info("Applying the openpi-thor NVFP4 path: Gemma MLP weights use NVFP4 and activations stay on FP8")
+    elif quantize_attention_matmul:
+        logger.info("Applying FP8 quantization with explicit attention matmul quantizers")
+    else:
+        logger.info("Applying plain FP8 quantization")
 
     def forward_loop(mdl):
         mdl.eval()
@@ -637,6 +645,13 @@ def export_to_onnx_bundle(
     prepare_runtime()
     train_config = _resolve_train_config(config)
     bundle = _resolve_bundle(bundle_dir, config_name=train_config.name)
+    logger.info(
+        "Exporting ONNX: config=%s bundle=%s precision=%s steps=%s",
+        train_config.name,
+        bundle.bundle_dir,
+        _artifact_key(options),
+        options.num_steps,
+    )
     policy, _ = load_pytorch_bundle(
         train_config,
         bundle.bundle_dir,
@@ -649,6 +664,7 @@ def export_to_onnx_bundle(
     model = prepare_model_for_export_precision(model, compute_dtype=torch.float16)
 
     device = next(model.parameters()).device
+    logger.info("Prepared export model on %s", device)
     if options.precision.lower() == "fp8":
         if calibration_source is None:
             if options.allow_dummy_calibration:
@@ -670,6 +686,7 @@ def export_to_onnx_bundle(
         )
         if len(calibration_batches) == 0:
             raise CalibrationError("Calibration source produced zero valid samples.")
+        logger.info("Quantizing with %d calibration batch(es)", len(calibration_batches))
         model = quantize_model(
             model,
             calibration_data=calibration_batches,
@@ -698,6 +715,7 @@ def export_to_onnx_bundle(
 
     key = _artifact_key(options)
     onnx_path = onnx_dir / f"model_{key}.onnx"
+    logger.info("Exporting ONNX graph to %s", onnx_path)
     with torch.no_grad():
         torch.onnx.export(
             wrapped_model,
@@ -720,6 +738,8 @@ def export_to_onnx_bundle(
         )
     postprocess_onnx_model(onnx_path, enable_llm_nvfp4=options.enable_llm_nvfp4)
     checker_warning = _validate_exported_onnx(onnx_path, enable_llm_nvfp4=options.enable_llm_nvfp4)
+    if checker_warning is not None:
+        logger.info("Accepted TensorRT-specific ONNX checker warning for %s", onnx_path.name)
 
     bundle.precision = key
     bundle.num_steps = options.num_steps
@@ -758,4 +778,6 @@ def export_to_onnx_bundle(
         report_key="export",
     )
     bundle.save()
+    logger.info("Recorded ONNX artifact %s", onnx_path)
+    logger.info("Updated bundle manifest %s", bundle.metadata_path)
     return bundle

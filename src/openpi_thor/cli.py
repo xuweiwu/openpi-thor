@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 from typing import Annotated
 
 import tyro
 
 from openpi_thor._schema import EngineProfile
 from openpi_thor._schema import ExportOptions
+
+
+def _configure_logging() -> None:
+    """Enable concise stderr status updates for top-level command execution."""
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -414,6 +421,7 @@ Command = (
 def main() -> None:
     """Parse CLI arguments and dispatch to the selected openpi-thor command."""
 
+    _configure_logging()
     command = tyro.cli(Command)
     match command:
         case DoctorCommand():

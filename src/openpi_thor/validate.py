@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,8 @@ from openpi_thor._schema import ValidationReport
 from openpi_thor.calibration import sample_dataset_examples
 from openpi_thor.runtime import load_pytorch_bundle
 from openpi_thor.runtime import load_tensorrt_policy
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_train_config(config: str | _config.TrainConfig) -> _config.TrainConfig:
@@ -274,6 +277,19 @@ def _record_validation_report(
     return report
 
 
+def _log_validation_summary(report: ValidationReport) -> None:
+    """Emit a concise one-line validation summary."""
+
+    logger.info(
+        "Validation summary: passed=%s mean_cos=%.6f min_cos=%.6f mean_abs=%.6f max_abs=%.6f",
+        report.passed,
+        report.mean_cosine,
+        report.min_cosine,
+        report.mean_abs_error,
+        report.max_abs_error,
+    )
+
+
 def compare_backends(
     config: str | _config.TrainConfig,
     bundle_dir: str | Path,
@@ -294,6 +310,7 @@ def compare_backends(
 
     train_config = _resolve_train_config(config)
     bundle = _resolve_bundle(bundle_dir, config_name=train_config.name)
+    logger.info("Validating %s against JAX for bundle %s", candidate_backend, bundle.bundle_dir)
 
     if examples is None:
         examples = sample_dataset_examples(
@@ -302,6 +319,7 @@ def compare_backends(
             dataset_repo_id=dataset_repo_id,
             dataset_root=dataset_root,
         )
+    logger.info("Loaded %d validation example(s)", len(examples))
 
     reference_policy, reference_path, reference_precision = _load_policy_for_backend(
         train_config,
@@ -321,6 +339,8 @@ def compare_backends(
         pytorch_device=pytorch_device,
         reference_jax_platform=reference_jax_platform,
     )
+    logger.info("Reference backend: jax (%s)", reference_path)
+    logger.info("Candidate backend: %s (%s)", candidate_backend, candidate_path)
 
     thresholds = thresholds or _default_thresholds(
         bundle,
@@ -361,7 +381,10 @@ def compare_backends(
     )
     if candidate_backend == "tensorrt" and report.passed and candidate_path is not None:
         bundle.set_recommended_engine(candidate_path, artifact_key=artifact_key)
+        logger.info("Marked %s as the recommended engine", candidate_path)
     bundle.save()
+    _log_validation_summary(report)
+    logger.info("Updated bundle manifest %s", bundle.metadata_path)
     return report
 
 
@@ -383,6 +406,7 @@ def compare_tensorrt_engines(
 
     train_config = _resolve_train_config(config)
     bundle = _resolve_bundle(bundle_dir, config_name=train_config.name)
+    logger.info("Comparing TensorRT engines for bundle %s", bundle.bundle_dir)
 
     if examples is None:
         examples = sample_dataset_examples(
@@ -391,6 +415,7 @@ def compare_tensorrt_engines(
             dataset_repo_id=dataset_repo_id,
             dataset_root=dataset_root,
         )
+    logger.info("Loaded %d validation example(s)", len(examples))
 
     reference_policy, resolved_reference_path, reference_precision = _load_policy_for_backend(
         train_config,
@@ -408,6 +433,8 @@ def compare_tensorrt_engines(
         default_prompt=default_prompt,
         pytorch_device=pytorch_device,
     )
+    logger.info("Reference engine: %s", resolved_reference_path)
+    logger.info("Candidate engine: %s", resolved_candidate_path)
 
     thresholds = thresholds or _default_thresholds(
         bundle,
@@ -446,4 +473,6 @@ def compare_tensorrt_engines(
         dataset_root=dataset_root,
     )
     bundle.save()
+    _log_validation_summary(report)
+    logger.info("Updated bundle manifest %s", bundle.metadata_path)
     return report

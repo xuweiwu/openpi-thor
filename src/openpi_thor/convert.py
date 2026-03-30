@@ -103,7 +103,13 @@ def convert_jax_checkpoint(
     if hasattr(model_config, "pytorch_compile_mode"):
         model_config = dataclasses.replace(model_config, pytorch_compile_mode=None)
 
-    logger.info("Converting JAX checkpoint %s into PyTorch bundle %s", checkpoint_dir, bundle_dir)
+    logger.info(
+        "Converting JAX checkpoint to PyTorch bundle: config=%s checkpoint=%s bundle=%s precision=%s",
+        train_config.name,
+        checkpoint_dir,
+        bundle_dir,
+        precision,
+    )
     converter.convert_pi0_checkpoint(
         str(checkpoint_dir),
         precision,
@@ -113,6 +119,7 @@ def convert_jax_checkpoint(
 
     if copy_assets and not (bundle_dir / "assets").exists():
         if assets_source := _resolve_assets_source(checkpoint_dir):
+            logger.info("Copying assets from %s", assets_source)
             shutil.copytree(assets_source, bundle_dir / "assets", dirs_exist_ok=True)
 
     config_json = bundle_dir / "config.json"
@@ -144,4 +151,6 @@ def convert_jax_checkpoint(
         },
     )
     bundle.save()
+    logger.info("Wrote converted weights to %s", bundle.weight_path)
+    logger.info("Updated bundle manifest %s", bundle.metadata_path)
     return bundle

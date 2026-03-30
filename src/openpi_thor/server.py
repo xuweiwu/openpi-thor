@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from openpi.serving import websocket_policy_server
 from openpi.training import config as _config
 
 from openpi_thor.runtime import load_tensorrt_policy
+
+logger = logging.getLogger(__name__)
 
 
 def serve(
@@ -21,6 +24,7 @@ def serve(
 ) -> None:
     """Start the websocket policy server backed by a TensorRT engine."""
 
+    logger.info("Loading TensorRT policy for bundle %s", Path(bundle_dir).expanduser().resolve())
     policy = load_tensorrt_policy(
         config,
         bundle_dir,
@@ -29,6 +33,7 @@ def serve(
         default_prompt=default_prompt,
         pytorch_device=pytorch_device,
     )
+    logger.info("Starting websocket policy server on %s:%s", host, port)
     server = websocket_policy_server.WebsocketPolicyServer(
         policy=policy,
         host=host,
