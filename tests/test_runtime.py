@@ -54,8 +54,10 @@ def test_install_tensorrt_sample_actions_refreshes_cached_policy_reference() -> 
 
 def test_unvalidated_fp8_bundle_is_rejected_for_serving(tmp_path) -> None:
     bundle = ArtifactBundle(bundle_dir=tmp_path, config_name="pi05_xlerobot_pinc_finetune", precision="fp8")
+    fp8_engine = tmp_path / "model_fp8.engine"
+    bundle.set_engine_path("model_fp8", fp8_engine, artifact_key="fp8")
     with pytest.raises(Exception):
-        _ensure_ready_for_tensorrt(bundle, require_validated=True)
+        _ensure_ready_for_tensorrt(bundle, fp8_engine, require_validated=True)
 
     bundle.set_validation_report(
         "tensorrt",
@@ -63,10 +65,26 @@ def test_unvalidated_fp8_bundle_is_rejected_for_serving(tmp_path) -> None:
             reference_backend="jax",
             candidate_backend="tensorrt",
             config_name=bundle.config_name,
+            candidate_path=str(fp8_engine),
+            precision="fp8",
             passed=True,
         ),
+        artifact_key="fp8",
     )
-    _ensure_ready_for_tensorrt(bundle, require_validated=True)
+    _ensure_ready_for_tensorrt(bundle, fp8_engine, require_validated=True)
+
+
+def test_mixed_bundle_can_serve_recommended_fp16_engine_even_if_bundle_precision_is_fp8(tmp_path) -> None:
+    bundle = ArtifactBundle(bundle_dir=tmp_path, config_name="pi05_xlerobot_pinc_finetune", precision="fp8_nvfp4")
+    fp16_engine = tmp_path / "model_fp16.engine"
+    fp8_engine = tmp_path / "model_fp8.engine"
+    bundle.set_engine_path("model_fp16", fp16_engine, artifact_key="fp16")
+    bundle.set_engine_path("model_fp8", fp8_engine, artifact_key="fp8")
+    bundle.set_recommended_engine(fp16_engine, artifact_key="fp16")
+
+    _ensure_ready_for_tensorrt(bundle, fp16_engine, require_validated=True)
+    with pytest.raises(Exception):
+        _ensure_ready_for_tensorrt(bundle, fp8_engine, require_validated=True)
 
 
 def test_candidate_engine_path_prefers_recommended_engine(tmp_path) -> None:

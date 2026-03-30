@@ -220,13 +220,35 @@ def _bundle_is_validated(bundle: ArtifactBundle) -> bool:
     return any(report.passed for report in bundle.validation_reports.values())
 
 
-def _ensure_ready_for_tensorrt(bundle: ArtifactBundle, *, require_validated: bool) -> None:
+def _selected_engine_artifact(bundle: ArtifactBundle, engine_path: Path) -> tuple[str | None, str | None]:
+    """Resolve the artifact key and precision for one selected TensorRT engine path."""
+
+    resolved_engine = engine_path.expanduser().resolve()
+    for artifact_key, artifact in bundle.artifacts.items():
+        for path_ref in artifact.engine_paths.values():
+            if Path(path_ref).expanduser().resolve() == resolved_engine:
+                return artifact_key, artifact.precision
+    return None, bundle.precision
+
+
+def _ensure_ready_for_tensorrt(bundle: ArtifactBundle, engine_path: Path, *, require_validated: bool) -> None:
     if not require_validated:
+        artifact_key, precision = _selected_engine_artifact(bundle, engine_path)
+        if precision and precision.startswith("fp8"):
+            logger.info("Validation gate disabled for %s engine %s", precision, engine_path)
         return
-    if bundle.precision and bundle.precision.startswith("fp8") and not _bundle_is_validated(bundle):
+    artifact_key, precision = _selected_engine_artifact(bundle, engine_path)
+    if precision and precision.startswith("fp8"):
+        logger.info("Checking validation status for %s engine %s", precision, engine_path)
+        reports = bundle.validation_reports.values()
+        if artifact_key is not None and artifact_key in bundle.artifacts:
+            reports = bundle.artifacts[artifact_key].validation_reports.values()
+        if any(report.passed for report in reports):
+            logger.info("Found a passing validation report for %s", engine_path)
+            return
         raise ValidationError(
-            "Refusing to serve an FP8/NVFP4 bundle without a passing validation report. "
-            "Run openpi-thor validate first or pass require_validated=False."
+            "Refusing to serve an FP8/NVFP4 engine without a passing validation report for that artifact. "
+            "Run openpi-thor validate first or pass --no-require-validated."
         )
 
 
@@ -320,11 +342,20 @@ def load_tensorrt_policy(
     prepare_runtime()
     train_config = _resolve_train_config(config)
     bundle = _resolve_bundle(bundle_dir, config_name=train_config.name)
-    _ensure_ready_for_tensorrt(bundle, require_validated=require_validated)
     resolved_engine_path = _candidate_engine_path(bundle, engine_path)
+    artifact_key, precision = _selected_engine_artifact(bundle, resolved_engine_path)
+    source = "bundle recommendation" if engine_path is None else "explicit --engine-path"
+    logger.info(
+        "Selected TensorRT engine %s (%s%s)",
+        resolved_engine_path,
+        source,
+        f", precision={precision}" if precision is not None else "",
+    )
+    _ensure_ready_for_tensorrt(bundle, resolved_engine_path, require_validated=require_validated)
     if not resolved_engine_path.exists():
         raise FileNotFoundError(f"TensorRT engine not found at {resolved_engine_path}")
 
+    logger.info("Loading PyTorch bundle state and transforms for TensorRT serving")
     policy, _ = load_pytorch_bundle(
         train_config,
         bundle.bundle_dir,
@@ -338,4 +369,5 @@ def load_tensorrt_policy(
     engine = trt_torch.Engine(str(resolved_engine_path))
     logger.info("Attaching TensorRT engine %s", resolved_engine_path)
     _install_tensorrt_sample_actions(policy, engine)
+    logger.info("TensorRT policy ready")
     return policy
