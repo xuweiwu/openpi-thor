@@ -43,7 +43,14 @@ cd <OPENPI_REPO>
 git clone <OPENPI_THOR_REPO_URL> packages/openpi-thor
 ```
 
-### 2. Patch the host root `pyproject.toml`
+### 2. Patch the host repo for companion integration
+
+This patch step is important on older upstream `openpi` checkouts. Besides `pyproject.toml`
+settings, it also patches the host source tree when needed so newer `lerobot` tags keep
+working with:
+
+- `src/openpi/training/data_loader.py`
+- `src/openpi/transforms.py`
 
 Preview the required changes:
 
@@ -128,7 +135,35 @@ openpi-thor prepare-engine \
 
 This builds TensorRT with strongly typed precision by default.
 
-### 8. Inspect the result or serve it
+### 8. Recommended: validate the result
+
+These validation steps are not strictly required, but they are recommended before serving on a
+real robot.
+
+Validate the converted PyTorch policy or one TensorRT engine against the JAX reference:
+
+```bash
+openpi-thor validate \
+  --config <PI05_TRAIN_CONFIG> \
+  --bundle-dir /path/to/bundle \
+  --reference-checkpoint-dir /path/to/jax-checkpoint \
+  --candidate-backend pytorch
+```
+
+Or compare one TensorRT engine against another, for example `fp8` against the recommended `fp16`
+engine:
+
+```bash
+openpi-thor validate-tensorrt \
+  --config <PI05_TRAIN_CONFIG> \
+  --bundle-dir /path/to/bundle \
+  --candidate-engine-path /path/to/bundle/engine/model_fp8.engine
+```
+
+If `--reference-engine-path` is omitted, `validate-tensorrt` uses the bundle's recommended
+engine.
+
+### 9. Inspect the result or serve it
 
 ```bash
 openpi-thor status --bundle-dir /path/to/bundle --verbose
@@ -310,7 +345,7 @@ The supported v1 companion-repo model assumes:
   - `examples/convert_jax_model_to_pytorch.py`
   - `src/openpi/models_pytorch/transformers_replace/...`
 
-The patch script only edits the host root `pyproject.toml`. It ensures:
+The patch script only edits host files that `openpi-thor` depends on. It ensures:
 
 - `tool.uv.override-dependencies` contains:
   - `ml-dtypes==0.5.1`
@@ -320,11 +355,44 @@ The patch script only edits the host root `pyproject.toml`. It ensures:
   - `openpi = { workspace = true }`
   - `openpi-client = { workspace = true }`
   - `lerobot = { git = "...", tag = "v0.5.0" }`
+- if the host repo still uses the older upstream LeRobot import in
+  `src/openpi/training/data_loader.py`, it patches that file to support newer LeRobot tags too
+- if the host repo still uses the older upstream `PromptFromLeRobotTask` implementation in
+  `src/openpi/transforms.py`, it patches that file so newer LeRobot task metadata also works
+
+If your host repo already carries the newer LeRobot import and the DataFrame-aware
+`PromptFromLeRobotTask`, these source patch steps become a no-op.
+
+These source patches matter most for real-dataset flows, especially:
+
+- FP8 calibration on LeRobot data
+- `openpi-thor validate`
+- `openpi-thor validate-tensorrt`
+- any config with `prompt_from_task=True`
 
 Manual fallback:
 
 - add those same `tool.uv.override-dependencies`, `tool.uv.conflicts`, and `tool.uv.sources`
   entries by hand if you do not want to run the patch script
+- if needed, update `src/openpi/training/data_loader.py` from:
+
+```python
+import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+```
+
+  to:
+
+```python
+try:
+    import lerobot.datasets.lerobot_dataset as lerobot_dataset
+except ImportError:
+    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+```
+
+- if needed, update `PromptFromLeRobotTask` in `src/openpi/transforms.py` so it supports both
+  dict-style task mappings and newer DataFrame-style LeRobot task metadata
+- if you apply the `PromptFromLeRobotTask` fallback manually, also make sure `Any` is imported
+  from `typing`
 
 ## Tested host and dependency matrix
 

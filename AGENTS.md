@@ -8,7 +8,7 @@ This package is a Jetson AGX Thor deployment companion for OpenPI `pi05_*` model
 not a standalone wheel-first project yet. The supported v1 integration model is:
 
 - clone `openpi-thor` into a host `openpi` checkout at exactly `packages/openpi-thor`
-- patch the host root `pyproject.toml`
+- patch the host repo for companion integration
 - create a dedicated Jetson AGX Thor runtime venv
 - use the installed `openpi-thor` console script inside that runtime
 
@@ -152,7 +152,21 @@ The patch script should stay:
 
 - preview-first by default
 - idempotent
-- limited to the host root `pyproject.toml`
+- limited to the small set of host files that `openpi-thor` depends on
+
+Today that means:
+
+- the host root `pyproject.toml`
+- `src/openpi/training/data_loader.py`
+- `src/openpi/transforms.py`
+
+The two source patches matter for newer `lerobot` tags:
+
+- `data_loader.py`
+  needs the newer `lerobot.datasets.lerobot_dataset` import path, with a fallback for older tags
+- `transforms.py`
+  needs the newer `PromptFromLeRobotTask` logic so `dataset_meta.tasks` can be either a dict or
+  a pandas DataFrame, and the patch must also add `Any` to the typing import when needed
 
 ## Clean-room issues already discovered
 

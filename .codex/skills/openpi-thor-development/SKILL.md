@@ -10,7 +10,7 @@ Use this skill when working on `packages/openpi-thor`, especially for:
 ## First checks
 
 1. Confirm the checkout path is exactly `packages/openpi-thor`.
-2. Check whether the host root `pyproject.toml` is patched:
+2. Check whether the host repo companion patch is applied:
    ```bash
    python packages/openpi-thor/scripts/patch_host_openpi.py --host-root .
    ```
@@ -56,6 +56,11 @@ uv pip install --python .venv-thor/bin/python --no-deps \
 - `lerobot` must be installed with `--no-deps`.
 - `tool.uv.sources.openpi = { workspace = true }` is required in the host root.
 - old `ml-dtypes==0.4.1` pins must be replaced, not duplicated.
+- older upstream `openpi` may also need source patches in:
+  - `src/openpi/training/data_loader.py`
+  - `src/openpi/transforms.py`
+- the `transforms.py` patch is not just logic replacement; it may also need `Any` added to the
+  `typing` import.
 - a backup checkout with the same package name under `packages/` breaks `uv` resolution.
 - `prepare-engine` imports `calibration.py`, so `torchvision` must be available even for FP16.
 - `openpi_on_thor` is tutorial/reference only; runtime code should not depend on it.
