@@ -187,6 +187,9 @@ all arguments for one command.
   High-level command that can export ONNX, build TensorRT, and optionally validate in one step.
 - `openpi-thor validate`
   Compares PyTorch or TensorRT outputs against the JAX reference model on real dataset samples.
+- `openpi-thor validate-tensorrt`
+  Compares one TensorRT engine against another, such as `fp8` or `fp8+nvfp4` against the
+  recommended `fp16` engine.
 - `openpi-thor status`
   Prints a compact summary of bundle contents, recommended engine, validation state, and report files.
 - `openpi-thor serve`
@@ -207,6 +210,11 @@ openpi-thor prepare-engine \
   --reference-checkpoint-dir /path/to/jax-checkpoint
 ```
 
+The Jetson AI Lab tutorial warns that pure fp16 export is unsupported for its tutorial exporter
+because Pi0.5 is BF16-native and naive fp16 overflows in Gemma. Our validated fp16 path is a
+custom `openpi-thor` extension, not a contradiction: it preserves fp32 stability islands during
+export and builds TensorRT engines with `--strongly-typed` by default.
+
 ### Build FP8 with real-data calibration
 
 ```bash
@@ -214,10 +222,18 @@ openpi-thor prepare-engine \
   --config <PI05_TRAIN_CONFIG> \
   --bundle-dir /path/to/bundle \
   --precision fp8 \
-  --num-calibration-samples 32 \
   --validate \
   --reference-checkpoint-dir /path/to/jax-checkpoint
 ```
+
+`32` is the default calibration count. In our real-data sweeps, raising plain fp8 calibration to
+`128` did not improve accuracy, so `openpi-thor` keeps `32` as the fast default. Use `128` or
+`256` only when you explicitly want a slower comparison sweep.
+
+`--enable-llm-nvfp4` in `openpi-thor` currently means a narrower path than the original tutorial:
+Gemma MLP weights use NVFP4 while the rest of the language-model activations stay on fp8. On the
+tested Jetson AGX Thor stack, this narrower path stayed in the same error regime as pure fp8,
+while broader full-layer NVFP4 drifted badly after TensorRT lowering.
 
 Optional dataset overrides for calibration and validation:
 
@@ -226,10 +242,62 @@ Optional dataset overrides for calibration and validation:
 
 If omitted, `openpi-thor` uses the dataset specified by the training config.
 
+### Compare TensorRT precisions directly
+
+Keep `validate` for JAX-based checks. Use `validate-tensorrt` when you want to compare one
+engine against another on the same real dataset samples.
+
+```bash
+openpi-thor validate-tensorrt \
+  --config <PI05_TRAIN_CONFIG> \
+  --bundle-dir /path/to/bundle \
+  --candidate-engine-path /path/to/bundle/engine/model_fp8.engine
+```
+
+If `--reference-engine-path` is omitted, `validate-tensorrt` uses the bundle's recommended
+engine, which is normally the validated `fp16` engine.
+
 ### Override the recommended engine
 
 Normally `serve` uses the recommended engine recorded in the bundle. Use `--engine-path` only
 for A/B tests or debugging.
+
+## Why these defaults exist
+
+Two design choices in `openpi-thor` are deliberate departures from a naive “export everything in
+fp16” or “turn on broad NVFP4 everywhere” approach.
+
+### FP16: preserve stability islands and use strongly typed TensorRT
+
+The Jetson AI Lab tutorial is correct that a naive pure-fp16 export of Pi0.5 is unsafe: the model
+is BF16-native, and weakly typed TensorRT builds can overflow numerically sensitive Gemma
+operations such as RMSNorm and attention-related reductions. In our debugging on Jetson AGX Thor,
+that weakly typed fp16 path produced large regressions against JAX.
+
+`openpi-thor` therefore uses a custom fp16 path instead:
+
+- preserve selected fp32 stability islands during export
+- build TensorRT with `--strongly-typed` by default
+
+That combination was the difference between the broken and usable fp16 paths on the tested stack.
+In our real-sample validations, the corrected fp16 TensorRT engine matched JAX closely and became
+the recommended deployment path.
+
+### NVFP4: broad full-layer NVFP4 regressed badly after TensorRT lowering
+
+The original broad NVFP4 path was much worse. Quantized PyTorch stayed reasonably close to the fp8
+baseline, but the TensorRT engine drifted badly after ONNX/TensorRT lowering. In our use case, the
+broad full-layer `fp8+nvfp4` path showed roughly a `30x` larger mean absolute error than pure fp8.
+
+That is why `openpi-thor` does not keep the broad full-layer NVFP4 recipe. The current
+`--enable-llm-nvfp4` path is intentionally narrower:
+
+- Gemma MLP weights use NVFP4
+- language-model activations stay on fp8
+
+That narrower path brought the TensorRT result back into the same accuracy regime as pure fp8 on
+the tested Jetson AGX Thor stack when compared against both JAX and the reference fp16 TensorRT
+engine.
 
 ## Companion-repo integration details
 
@@ -295,6 +363,14 @@ Important notes:
 - `openpi-thor` builds TensorRT engines with `--strongly-typed` by default. This preserves
   explicit FP32 stability islands in Gemma-based models, such as RMSNorm, and avoids the large
   numerical drift seen with weakly typed builds on Jetson AGX Thor.
+- The tutorial's warning about pure fp16 export applies to its own exporter. `openpi-thor`
+  supports a custom fp16 path that preserves fp32 stability islands and uses strongly typed
+  TensorRT builds.
+- `openpi-thor` also narrows NVFP4 to Gemma MLP weights instead of enabling broad full-layer
+  NVFP4. That is an intentional deviation from the tutorial because it produced much better
+  TensorRT accuracy on the tested Jetson AGX Thor stack.
+- FP8 calibration defaults to `32` real samples. Use `128` or `256` only for slower calibration
+  sweeps and comparison experiments.
 
 ## Troubleshooting
 
