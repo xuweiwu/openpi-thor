@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from openpi_thor._schema import ArtifactBundle
+from openpi_thor._schema import ExportOptions
 from openpi_thor._schema import ValidationReport
 
 
@@ -27,7 +28,9 @@ def test_artifact_records_and_status_round_trip(tmp_path: Path) -> None:
             reference_backend="jax",
             candidate_backend="tensorrt",
             config_name=bundle.config_name,
+            reference_path="/tmp/checkpoint",
             candidate_path=str(engine_path),
+            reference_precision=None,
             precision="fp16",
             passed=True,
             per_example=[{"dataset_index": 1, "cosine": 0.99, "mean_abs_error": 0.1, "max_abs_error": 0.2}],
@@ -80,3 +83,8 @@ def test_artifact_records_and_status_round_trip(tmp_path: Path) -> None:
     summary = manifest["artifacts"]["fp16"]["validation_reports"]["tensorrt:model_fp16_strongly_typed"]
     assert "per_example" not in summary
     assert "notes" not in summary
+    assert summary["reference_path"] == "/tmp/checkpoint"
+
+
+def test_export_options_default_calibration_count_is_32() -> None:
+    assert ExportOptions().num_calibration_samples == 32

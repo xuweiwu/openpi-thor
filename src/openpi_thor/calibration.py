@@ -200,7 +200,7 @@ def _noise_tensor(
         action_dim,
         generator=generator,
         device=device,
-        dtype=torch.float16 if device.type == "cuda" else torch.float32,
+        dtype=torch.float32,
     )
 
 

@@ -120,6 +120,8 @@ class ValidationReport:
     reference_backend: str
     candidate_backend: str
     config_name: str
+    reference_path: str | None = None
+    reference_precision: str | None = None
     candidate_path: str | None = None
     precision: str | None = None
     num_examples: int = 0
@@ -137,6 +139,8 @@ class ValidationReport:
             "reference_backend": self.reference_backend,
             "candidate_backend": self.candidate_backend,
             "config_name": self.config_name,
+            "reference_path": self.reference_path,
+            "reference_precision": self.reference_precision,
             "candidate_path": self.candidate_path,
             "precision": self.precision,
             "num_examples": self.num_examples,
@@ -155,6 +159,8 @@ class ValidationReport:
             "reference_backend": self.reference_backend,
             "candidate_backend": self.candidate_backend,
             "config_name": self.config_name,
+            "reference_path": self.reference_path,
+            "reference_precision": self.reference_precision,
             "candidate_path": self.candidate_path,
             "precision": self.precision,
             "num_examples": self.num_examples,
@@ -172,6 +178,8 @@ class ValidationReport:
             reference_backend=str(data["reference_backend"]),
             candidate_backend=str(data["candidate_backend"]),
             config_name=str(data["config_name"]),
+            reference_path=str(data["reference_path"]) if data.get("reference_path") else None,
+            reference_precision=str(data["reference_precision"]) if data.get("reference_precision") else None,
             candidate_path=str(data["candidate_path"]) if data.get("candidate_path") else None,
             precision=str(data["precision"]) if data.get("precision") else None,
             num_examples=int(data.get("num_examples", 0)),

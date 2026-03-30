@@ -18,6 +18,7 @@ __all__ = [
     "ValidationReport",
     "build_engine",
     "compare_backends",
+    "compare_tensorrt_engines",
     "convert_jax_checkpoint",
     "export_to_onnx_bundle",
     "inspect_jax_checkpoint",
@@ -57,6 +58,7 @@ _EXPORTS = {
     "bundle_status": ("openpi_thor.workflow", "bundle_status"),
     "serve": ("openpi_thor.server", "serve"),
     "compare_backends": ("openpi_thor.validate", "compare_backends"),
+    "compare_tensorrt_engines": ("openpi_thor.validate", "compare_tensorrt_engines"),
     "sample_dataset_examples": ("openpi_thor.validate", "sample_dataset_examples"),
 }
 

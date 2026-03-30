@@ -95,15 +95,56 @@ def test_status_cli_prints_bundle_status(monkeypatch, tmp_path: Path) -> None:
     assert payload["verbose"] is True
 
 
+def test_validate_tensorrt_cli_prints_report(monkeypatch, tmp_path: Path) -> None:
+    class _ValidationReport:
+        def to_dict(self) -> dict[str, object]:
+            return {
+                "reference_backend": "tensorrt",
+                "candidate_backend": "tensorrt",
+                "reference_path": "/tmp/model_fp16.engine",
+                "candidate_path": "/tmp/model_fp8.engine",
+                "passed": False,
+            }
+
+    import openpi_thor.validate as validate
+
+    monkeypatch.setattr(validate, "compare_tensorrt_engines", lambda *args, **kwargs: _ValidationReport())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "openpi_thor.cli",
+            "validate-tensorrt",
+            "--config",
+            "pi05_xlerobot_pinc_finetune",
+            "--bundle-dir",
+            str(tmp_path),
+            "--candidate-engine-path",
+            "/tmp/model_fp8.engine",
+        ],
+    )
+
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        cli.main()
+
+    payload = json.loads(stdout.getvalue())
+    assert payload["reference_backend"] == "tensorrt"
+    assert payload["candidate_backend"] == "tensorrt"
+    assert payload["candidate_path"] == "/tmp/model_fp8.engine"
+
+
 @pytest.mark.parametrize("help_flag", ["--help", "-h"])
 def test_top_level_help_lists_command_descriptions(monkeypatch, help_flag: str) -> None:
     code, output = _run_cli(["openpi_thor.cli", help_flag], monkeypatch)
 
     assert code == 0
     assert "doctor" in output
-    assert "Check the runtime, TensorRT tools, and host integration." in output
+    assert "Check the runtime, TensorRT tools, and host" in output
     assert "prepare-engine" in output
     assert "Export ONNX, build TensorRT, and optionally validate." in output
+    assert "validate-tensorrt" in output
+    assert "Compare one TensorRT engine directly against another" in output
 
 
 @pytest.mark.parametrize(
@@ -157,6 +198,15 @@ def test_top_level_help_lists_command_descriptions(monkeypatch, help_flag: str) 
                 "Compare PyTorch or TensorRT outputs against the JAX reference.",
                 "Backend to evaluate against JAX.",
                 "Specific TensorRT engine to validate",
+            ],
+        ),
+        (
+            "validate-tensorrt",
+            "--help",
+            [
+                "Compare one TensorRT engine directly against another engine.",
+                "TensorRT engine path to evaluate as the candidate.",
+                "Defaults to the bundle's recommended engine.",
             ],
         ),
             (

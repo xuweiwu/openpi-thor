@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import contextlib
 import dataclasses
 import os
 from pathlib import Path
@@ -182,7 +183,8 @@ def postprocess_onnx_model(onnx_path: str | Path, *, enable_llm_nvfp4: bool = Fa
     if enable_llm_nvfp4:
         from modelopt.onnx.quantization.qdq_utils import fp4qdq_to_2dq
 
-        onnx_model = fp4qdq_to_2dq(onnx_model, verbose=True)
+        with _fast_nvfp4_float8_casts():
+            onnx_model = fp4qdq_to_2dq(onnx_model, verbose=True)
         graph = gs.import_onnx(onnx_model)
         graph.cleanup().toposort()
         onnx_model = gs.export_onnx(graph)
@@ -204,6 +206,57 @@ def postprocess_onnx_model(onnx_path: str | Path, *, enable_llm_nvfp4: bool = Fa
         if path.suffix in {".onnx", ".data", ".engine", ".json"}:
             continue
         path.unlink()
+
+
+@contextlib.contextmanager
+def _fast_nvfp4_float8_casts():
+    """Speed up ModelOpt's NVFP4 float8 scale conversion with a vectorized cast.
+
+    ModelOpt currently routes ``FLOAT8E4M3FN`` conversion through ONNX's reference
+    ``Cast.eval`` implementation, which loops over every element in Python and can
+    take many minutes on large Gemma-scale NVFP4 exports. ``ml_dtypes`` provides a
+    vectorized cast with matching saturating semantics for the finite scale tensors
+    used by ``fp4qdq_to_2dq``.
+    """
+
+    try:
+        import numpy as np
+        from modelopt.onnx.quantization import qdq_utils
+    except ImportError:
+        yield
+        return
+
+    original_eval = qdq_utils.Cast.eval
+
+    def _fast_eval(values, *, to, saturate=True):
+        import onnx
+
+        if to == onnx.TensorProto.FLOAT8E4M3FN:
+            return _fast_float8e4m3fn_array(values)
+        return original_eval(values, to=to, saturate=saturate)
+
+    qdq_utils.Cast.eval = staticmethod(_fast_eval)
+    try:
+        yield
+    finally:
+        qdq_utils.Cast.eval = original_eval
+
+
+def _fast_float8e4m3fn_array(values):
+    """Vectorize float32->FLOAT8E4M3FN conversion with ONNX-compatible saturation."""
+
+    import ml_dtypes
+    import numpy as np
+    from onnx._custom_element_types import float8e4m3fn
+
+    array = np.asarray(values, dtype=np.float32).copy()
+    pos_inf = np.isposinf(array)
+    neg_inf = np.isneginf(array)
+    finite = np.isfinite(array)
+    array[pos_inf] = 448.0
+    array[neg_inf] = -448.0
+    np.clip(array, -448.0, 448.0, out=array, where=finite)
+    return array.astype(ml_dtypes.float8_e4m3fn).view(float8e4m3fn)
 
 
 class ONNXWrapper(torch.nn.Module):
@@ -265,6 +318,10 @@ _FLOAT32_EXPORT_BUFFER_SELECTORS = (
     "rotary_emb.original_inv_freq",
 )
 
+_NVFP4_GEMMA_MLP_WEIGHT_SELECTOR = (
+    "paligemma_with_expert.paligemma.model.language_model.layers.*.mlp.*.weight_quantizer"
+)
+
 
 def _module_and_attr(root: torch.nn.Module, dotted_name: str) -> tuple[torch.nn.Module, str]:
     parts = dotted_name.split(".")
@@ -312,10 +369,78 @@ def prepare_model_for_export_precision(
     return model
 
 
+def _sanitize_nonfinite_like(tensor: torch.Tensor) -> torch.Tensor:
+    """Clamp pathological fp16 overflows back into the dtype's finite range."""
+
+    if not tensor.is_floating_point():
+        return tensor
+    finfo = torch.finfo(tensor.dtype)
+    return torch.nan_to_num(tensor, nan=0.0, posinf=finfo.max, neginf=finfo.min)
+
+
+def _apply_nvfp4_gemma_mlp_weight_only_quant_cfg(quant_cfg: dict) -> dict:
+    """Restrict NVFP4 to Gemma MLP weights while keeping activations on FP8.
+
+    Full-layer NVFP4 on the tested Jetson AGX Thor stack caused severe TensorRT
+    drift even when the quantized PyTorch model stayed close to the FP8 baseline.
+    Narrowing NVFP4 to Gemma MLP weights preserves most of the fp8 accuracy
+    while still exercising the NVFP4 export/runtime path.
+    """
+
+    quant_cfg["quant_cfg"][_NVFP4_GEMMA_MLP_WEIGHT_SELECTOR] = {
+        "num_bits": (2, 1),
+        "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+        "axis": None,
+        "enable": True,
+    }
+    return quant_cfg
+
+
+def _mark_nvfp4_gemma_mlp_weight_quantizers(model: torch.nn.Module) -> None:
+    """Stamp ONNX export hints for the Gemma MLP weights using NVFP4."""
+
+    for module_name, module in model.named_modules():
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        if ".mlp." not in module_name and not module_name.startswith("mlp."):
+            continue
+        weight_quantizer = getattr(module, "weight_quantizer", None)
+        if weight_quantizer is None:
+            continue
+        weight_quantizer._trt_high_precision_dtype = _trt_high_precision_dtype_for_tensor_dtype(module.weight.dtype)  # noqa: SLF001
+        weight_quantizer._onnx_quantizer_type = "static"  # noqa: SLF001
+
+
+def _patch_gemma_mlp_for_export(model: torch.nn.Module) -> None:
+    """Sanitize late Gemma MLP intermediates before fp8 calibration collects them.
+
+    On Jetson AGX Thor, the export-prepared fp16 path can produce inf values in
+    deep Gemma MLP intermediates for some real calibration samples. The final
+    sampler output remains finite, but ModelOpt aborts as soon as a quantizer
+    sees those inf activations. Sanitizing the MLP product keeps calibration
+    stable without changing the normal runtime policy path.
+    """
+
+    for module in model.modules():
+        if not all(hasattr(module, attr) for attr in ("gate_proj", "up_proj", "down_proj", "act_fn")):
+            continue
+        if getattr(module, "_openpi_thor_export_mlp_patch", False):
+            continue
+
+        def gemma_mlp_forward(self, x):
+            hidden = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+            hidden = _sanitize_nonfinite_like(hidden)
+            return self.down_proj(hidden)
+
+        module.forward = types.MethodType(gemma_mlp_forward, module)
+        module._openpi_thor_export_mlp_patch = True  # noqa: SLF001
+
+
 def patch_model_for_export(model: torch.nn.Module, *, compute_dtype: torch.dtype = torch.float16) -> torch.nn.Module:
     """Patch the PyTorch sampler into an ONNX-export-friendly inference loop."""
 
     model.compute_dtype = compute_dtype
+    _patch_gemma_mlp_for_export(model)
 
     vision_embeddings = model.paligemma_with_expert.paligemma.model.vision_tower.vision_model.embeddings
 
@@ -448,20 +573,7 @@ def quantize_model(
     quant_cfg["quant_cfg"]["nn.Conv2d"] = {"*": {"enable": False}}
 
     if enable_llm_nvfp4:
-        quant_cfg["quant_cfg"]["paligemma_with_expert.paligemma.model.language_model.layers.*"] = {
-            "num_bits": (2, 1),
-            "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
-            "axis": None,
-            "enable": True,
-        }
-        quant_cfg["quant_cfg"][
-            "paligemma_with_expert.paligemma.model.language_model.layers.*.output_quantizer"
-        ] = {
-            "num_bits": (2, 1),
-            "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
-            "axis": None,
-            "enable": False,
-        }
+        quant_cfg = _apply_nvfp4_gemma_mlp_weight_only_quant_cfg(quant_cfg)
 
     def forward_loop(mdl):
         mdl.eval()
@@ -472,22 +584,41 @@ def quantize_model(
 
     quantized_model = mtq.quantize(model, quant_cfg, forward_loop=forward_loop)
     if enable_llm_nvfp4:
-        from modelopt.torch.quantization.utils import is_quantized_linear
-
-        for module in quantized_model.modules():
-            if isinstance(module, torch.nn.Linear):
-                assert is_quantized_linear(module)
-                module.input_quantizer._trt_high_precision_dtype = "Half"  # noqa: SLF001
-                module.input_quantizer._onnx_quantizer_type = "dynamic"  # noqa: SLF001
-                module.output_quantizer._onnx_quantizer_type = "dynamic"  # noqa: SLF001
-                module.weight_quantizer._onnx_quantizer_type = "static"  # noqa: SLF001
+        _mark_nvfp4_gemma_mlp_weight_quantizers(quantized_model)
     return quantized_model
+
+
+def _trt_high_precision_dtype_for_tensor_dtype(dtype: torch.dtype) -> str:
+    """Map a tensor dtype to the TensorRT QDQ precision label expected by ModelOpt."""
+
+    if dtype == torch.float16:
+        return "Half"
+    if dtype == torch.bfloat16:
+        return "BFloat16"
+    return "Float"
 
 
 def _artifact_key(options: ExportOptions) -> str:
     if options.precision.lower() == "fp8" and options.enable_llm_nvfp4:
         return "fp8_nvfp4"
     return options.precision.lower()
+
+
+def _validate_exported_onnx(onnx_path: Path, *, enable_llm_nvfp4: bool) -> str | None:
+    """Run ONNX validation and return an accepted warning for TRT-specific NVFP4 graphs."""
+
+    import onnx
+
+    try:
+        # Large external-data models must be checked by path, not by loading the
+        # whole protobuf into memory first.
+        onnx.checker.check_model(str(onnx_path))
+    except onnx.onnx_cpp2py_export.checker.ValidationError as exc:
+        message = str(exc)
+        if enable_llm_nvfp4 and "block_size" in message and "DequantizeLinear" in message:
+            return message
+        raise
+    return None
 
 
 def export_to_onnx_bundle(
@@ -502,8 +633,6 @@ def export_to_onnx_bundle(
     dataset_root: str | Path | None = None,
 ) -> ArtifactBundle:
     """Export a bundle to ONNX and record the resulting artifact metadata."""
-
-    import onnx
 
     prepare_runtime()
     train_config = _resolve_train_config(config)
@@ -590,9 +719,7 @@ def export_to_onnx_bundle(
             },
         )
     postprocess_onnx_model(onnx_path, enable_llm_nvfp4=options.enable_llm_nvfp4)
-    # Large external-data models must be checked by path, not by loading the
-    # whole protobuf into memory first.
-    onnx.checker.check_model(str(onnx_path))
+    checker_warning = _validate_exported_onnx(onnx_path, enable_llm_nvfp4=options.enable_llm_nvfp4)
 
     bundle.precision = key
     bundle.num_steps = options.num_steps
@@ -605,6 +732,8 @@ def export_to_onnx_bundle(
         calibration_num_samples=calibration_num_samples,
         export_options=dataclasses.asdict(options),
     )
+    if options.enable_llm_nvfp4:
+        bundle.ensure_artifact(key, precision=key).extra["nvfp4_scope"] = "gemma_mlp_weight_only"
     bundle.write_report(
         f"export_{key}",
         {
@@ -621,6 +750,8 @@ def export_to_onnx_bundle(
             "calibration_num_samples": calibration_num_samples,
             "dataset_repo_id": dataset_repo_id,
             "dataset_root": str(dataset_root) if dataset_root is not None else None,
+            "nvfp4_scope": "gemma_mlp_weight_only" if options.enable_llm_nvfp4 else None,
+            "onnx_checker_warning": checker_warning,
             "export_options": dataclasses.asdict(options),
         },
         artifact_key=key,

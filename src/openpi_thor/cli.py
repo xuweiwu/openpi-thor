@@ -69,7 +69,12 @@ class ExportOnnxCommand:
     ] = 10
     enable_llm_nvfp4: Annotated[
         bool,
-        tyro.conf.arg(help="Enable NVFP4 quantization for the Gemma language-model layers during fp8 export."),
+        tyro.conf.arg(
+            help=(
+                "Enable the current openpi-thor NVFP4 path: Gemma MLP weights use NVFP4 while the rest of the "
+                "language-model activations stay on FP8."
+            )
+        ),
     ] = False
     quantize_attention_matmul: Annotated[
         bool,
@@ -193,6 +198,40 @@ class ValidateCommand:
 
 
 @dataclasses.dataclass(frozen=True)
+class ValidateTensorRTCommand:
+    """Compare one TensorRT engine against another on the same dataset examples."""
+
+    config: Annotated[
+        str,
+        tyro.conf.arg(help="Registered OpenPI training config name from the host repo."),
+    ]
+    bundle_dir: Annotated[
+        str,
+        tyro.conf.arg(help="Bundle directory used to resolve the recommended reference engine and write reports."),
+    ]
+    candidate_engine_path: Annotated[
+        str,
+        tyro.conf.arg(help="TensorRT engine path to evaluate as the candidate."),
+    ]
+    reference_engine_path: Annotated[
+        str | None,
+        tyro.conf.arg(help="Optional TensorRT engine path to use as the reference. Defaults to the bundle's recommended engine."),
+    ] = None
+    num_examples: Annotated[
+        int,
+        tyro.conf.arg(help="Number of dataset examples to compare with fixed-noise inference."),
+    ] = 8
+    dataset_repo_id: Annotated[
+        str | None,
+        tyro.conf.arg(help="Override the dataset repo id used to sample validation examples."),
+    ] = None
+    dataset_root: Annotated[
+        str | None,
+        tyro.conf.arg(help="Optional local LeRobot dataset root used together with --dataset-repo-id."),
+    ] = None
+
+
+@dataclasses.dataclass(frozen=True)
 class PrepareEngineCommand:
     """Export ONNX, build TensorRT, and optionally validate in one command."""
 
@@ -214,7 +253,12 @@ class PrepareEngineCommand:
     ] = 10
     enable_llm_nvfp4: Annotated[
         bool,
-        tyro.conf.arg(help="Enable NVFP4 quantization for the Gemma language-model layers during fp8 preparation."),
+        tyro.conf.arg(
+            help=(
+                "Enable the current openpi-thor NVFP4 path: Gemma MLP weights use NVFP4 while the rest of the "
+                "language-model activations stay on FP8."
+            )
+        ),
     ] = False
     quantize_attention_matmul: Annotated[
         bool,
@@ -346,6 +390,13 @@ Command = (
         tyro.conf.subcommand(name="validate", description="Compare PyTorch or TensorRT outputs against the JAX reference."),
     ]
     | Annotated[
+        ValidateTensorRTCommand,
+        tyro.conf.subcommand(
+            name="validate-tensorrt",
+            description="Compare one TensorRT engine directly against another engine.",
+        ),
+    ]
+    | Annotated[
         PrepareEngineCommand,
         tyro.conf.subcommand(name="prepare-engine", description="Export ONNX, build TensorRT, and optionally validate."),
     ]
@@ -427,6 +478,19 @@ def main() -> None:
                 candidate_backend=command.candidate_backend,
                 reference_checkpoint_dir=command.reference_checkpoint_dir,
                 engine_path=command.engine_path,
+                num_examples=command.num_examples,
+                dataset_repo_id=command.dataset_repo_id,
+                dataset_root=command.dataset_root,
+            )
+            print(json.dumps(report.to_dict(), indent=2))
+        case ValidateTensorRTCommand():
+            from openpi_thor.validate import compare_tensorrt_engines
+
+            report = compare_tensorrt_engines(
+                command.config,
+                command.bundle_dir,
+                candidate_engine_path=command.candidate_engine_path,
+                reference_engine_path=command.reference_engine_path,
                 num_examples=command.num_examples,
                 dataset_repo_id=command.dataset_repo_id,
                 dataset_root=command.dataset_root,

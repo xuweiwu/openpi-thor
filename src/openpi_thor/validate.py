@@ -55,14 +55,24 @@ def _default_thresholds(
     bundle: ArtifactBundle,
     candidate_backend: str,
     *,
+    reference_backend: str = "jax",
+    reference_path: str | Path | None = None,
     candidate_path: str | Path | None = None,
 ) -> dict[str, float]:
-    """Choose default similarity/error thresholds for a validation run."""
+    """Choose default similarity/error thresholds for one validation run."""
 
-    effective_precision = _artifact_precision_from_path(candidate_path, fallback=bundle.precision)
-    if candidate_backend == "pytorch":
+    reference_precision = _artifact_precision_from_path(reference_path)
+    candidate_precision = _artifact_precision_from_path(candidate_path, fallback=bundle.precision)
+    if (
+        reference_backend == "jax"
+        and candidate_backend == "pytorch"
+        and not (reference_precision and reference_precision.startswith("fp8"))
+    ):
         return {"min_cosine": 0.999, "mean_abs_error": 0.01, "max_abs_error": 0.05}
-    if effective_precision and effective_precision.startswith("fp8"):
+    if any(
+        precision is not None and precision.startswith("fp8")
+        for precision in (reference_precision, candidate_precision)
+    ):
         return {"min_cosine": 0.97, "mean_abs_error": 0.08, "max_abs_error": 0.3}
     return {"min_cosine": 0.995, "mean_abs_error": 0.03, "max_abs_error": 0.12}
 
@@ -80,72 +90,79 @@ def _artifact_precision_from_path(path: str | Path | None, *, fallback: str | No
     return fallback
 
 
-def _validation_key(candidate_backend: str, candidate_path: str | None) -> str:
+def _validation_key(
+    candidate_backend: str,
+    candidate_path: str | None,
+    *,
+    reference_backend: str = "jax",
+    reference_path: str | None = None,
+) -> str:
+    if candidate_backend == "tensorrt" and reference_backend == "tensorrt" and candidate_path and reference_path:
+        return f"tensorrt:{Path(reference_path).stem}:vs:{Path(candidate_path).stem}"
     if candidate_backend != "tensorrt" or candidate_path is None:
         return candidate_backend
     return f"{candidate_backend}:{Path(candidate_path).stem}"
 
 
-def compare_backends(
-    config: str | _config.TrainConfig,
-    bundle_dir: str | Path,
+def _resolve_reference_checkpoint_dir(
+    bundle: ArtifactBundle,
+    reference_checkpoint_dir: str | Path | None,
+) -> str | Path:
+    if reference_checkpoint_dir is not None:
+        return reference_checkpoint_dir
+    if bundle.source_checkpoint_dir is None:
+        raise ValueError("reference_checkpoint_dir is required when the bundle has no source checkpoint metadata.")
+    return bundle.source_checkpoint_dir
+
+
+def _resolve_engine_path(bundle: ArtifactBundle, engine_path: str | Path | None) -> Path:
+    if engine_path is not None:
+        return Path(engine_path).expanduser().resolve()
+    if recommended := bundle.get_recommended_engine_path():
+        return recommended.expanduser().resolve()
+    if bundle.engine_paths:
+        return Path(next(iter(bundle.engine_paths.values()))).expanduser().resolve()
+    raise FileNotFoundError("No TensorRT engine path was provided and the bundle has no recorded engine.")
+
+
+def _load_policy_for_backend(
+    train_config: _config.TrainConfig,
+    bundle: ArtifactBundle,
     *,
-    examples: list[dict[str, Any]] | None = None,
+    backend: str,
+    default_prompt: str | None,
+    pytorch_device: str | None,
     reference_checkpoint_dir: str | Path | None = None,
-    candidate_backend: str = "pytorch",
     engine_path: str | Path | None = None,
-    num_examples: int = 8,
-    thresholds: dict[str, float] | None = None,
-    default_prompt: str | None = None,
-    pytorch_device: str | None = None,
     reference_jax_platform: str = "cpu",
-    dataset_repo_id: str | None = None,
-    dataset_root: str | Path | None = None,
-) -> ValidationReport:
-    """Compare a PyTorch or TensorRT candidate against the JAX reference model.
-
-    The comparison uses fixed-noise inference on sampled dataset examples and
-    records the resulting report back into the bundle manifest and reports/.
-    """
-
-    train_config = _resolve_train_config(config)
-    bundle = _resolve_bundle(bundle_dir, config_name=train_config.name)
-
-    if reference_checkpoint_dir is None:
-        if bundle.source_checkpoint_dir is None:
-            raise ValueError("reference_checkpoint_dir is required when the bundle has no source checkpoint metadata.")
-        reference_checkpoint_dir = bundle.source_checkpoint_dir
-
-    if examples is None:
-        examples = sample_dataset_examples(
+):
+    if backend == "jax":
+        resolved_checkpoint_dir = _resolve_reference_checkpoint_dir(bundle, reference_checkpoint_dir)
+        if reference_jax_platform:
+            try:
+                jax.config.update("jax_platforms", reference_jax_platform)
+            except Exception:  # noqa: BLE001
+                pass
+        policy = _policy_config.create_trained_policy(
             train_config,
-            num_examples=num_examples,
-            dataset_repo_id=dataset_repo_id,
-            dataset_root=dataset_root,
+            resolved_checkpoint_dir,
+            default_prompt=default_prompt,
         )
+        return policy, str(Path(resolved_checkpoint_dir).expanduser().resolve()), None
 
-    if reference_jax_platform:
-        try:
-            jax.config.update("jax_platforms", reference_jax_platform)
-        except Exception:  # noqa: BLE001
-            pass
-
-    reference_policy = _policy_config.create_trained_policy(
-        train_config,
-        reference_checkpoint_dir,
-        default_prompt=default_prompt,
-    )
-    if candidate_backend == "pytorch":
-        candidate_policy, _ = load_pytorch_bundle(
+    if backend == "pytorch":
+        policy, _ = load_pytorch_bundle(
             train_config,
             bundle.bundle_dir,
             default_prompt=default_prompt,
             pytorch_device=pytorch_device,
         )
-        candidate_path = str(bundle.weight_path)
-    elif candidate_backend == "tensorrt":
-        resolved_engine_path = Path(engine_path).expanduser().resolve() if engine_path is not None else None
-        candidate_policy = load_tensorrt_policy(
+        weight_path = bundle.weight_path.expanduser().resolve()
+        return policy, str(weight_path), _artifact_precision_from_path(weight_path, fallback=bundle.precision)
+
+    if backend == "tensorrt":
+        resolved_engine_path = _resolve_engine_path(bundle, engine_path)
+        policy = load_tensorrt_policy(
             train_config,
             bundle.bundle_dir,
             engine_path=resolved_engine_path,
@@ -153,16 +170,33 @@ def compare_backends(
             default_prompt=default_prompt,
             pytorch_device=pytorch_device,
         )
-        candidate_path = str(resolved_engine_path or Path(next(iter(bundle.engine_paths.values()))).expanduser().resolve())
-    else:
-        raise ValueError(f"Unsupported candidate_backend={candidate_backend!r}")
+        return policy, str(resolved_engine_path), _artifact_precision_from_path(
+            resolved_engine_path, fallback=bundle.precision
+        )
 
-    thresholds = thresholds or _default_thresholds(bundle, candidate_backend, candidate_path=candidate_path)
+    raise ValueError(f"Unsupported backend={backend!r}")
 
+
+def _compare_policy_outputs(
+    train_config: _config.TrainConfig,
+    *,
+    examples: list[dict[str, Any]],
+    reference_policy,
+    candidate_policy,
+    reference_backend: str,
+    candidate_backend: str,
+    config_name: str,
+    reference_path: str | None = None,
+    reference_precision: str | None = None,
+    candidate_path: str | None = None,
+    candidate_precision: str | None = None,
+    thresholds: dict[str, float],
+) -> ValidationReport:
     per_example: list[dict[str, float | int]] = []
     cosine_values: list[float] = []
     mean_abs_values: list[float] = []
     max_abs_values: list[float] = []
+
     for example_index, example in enumerate(examples):
         noise = _make_noise(train_config.model.action_horizon, train_config.model.action_dim, seed=example_index)
         reference = reference_policy.infer(_clone_example(example), noise=noise)["actions"]
@@ -182,12 +216,16 @@ def compare_backends(
             }
         )
 
-    report = ValidationReport(
-        reference_backend="jax",
+    reference_label = reference_backend if reference_path is None else f"{reference_backend} ({Path(reference_path).name})"
+    candidate_label = candidate_backend if candidate_path is None else f"{candidate_backend} ({Path(candidate_path).name})"
+    return ValidationReport(
+        reference_backend=reference_backend,
         candidate_backend=candidate_backend,
-        config_name=train_config.name,
+        config_name=config_name,
+        reference_path=reference_path,
+        reference_precision=reference_precision,
         candidate_path=candidate_path,
-        precision=_artifact_precision_from_path(candidate_path, fallback=bundle.precision),
+        precision=candidate_precision,
         num_examples=len(per_example),
         passed=(
             min(cosine_values) >= thresholds["min_cosine"]
@@ -201,12 +239,21 @@ def compare_backends(
         thresholds=thresholds,
         per_example=per_example,
         notes=[
-            f"Compared {candidate_backend} against the JAX checkpoint with fixed-noise inference.",
+            f"Compared {candidate_label} against {reference_label} with fixed-noise inference.",
             "Examples were sampled through the config's LeRobot repack path before policy inference.",
         ],
     )
-    artifact_key = _artifact_precision_from_path(candidate_path, fallback=bundle.precision) if candidate_path else None
-    validation_key = _validation_key(candidate_backend, candidate_path)
+
+
+def _record_validation_report(
+    bundle: ArtifactBundle,
+    *,
+    report: ValidationReport,
+    validation_key: str,
+    artifact_key: str | None,
+    dataset_repo_id: str | None,
+    dataset_root: str | Path | None,
+) -> ValidationReport:
     bundle.set_validation_report(
         validation_key,
         report,
@@ -224,7 +271,179 @@ def compare_backends(
         artifact_key=artifact_key,
         report_key=f"validate:{validation_key}",
     )
+    return report
+
+
+def compare_backends(
+    config: str | _config.TrainConfig,
+    bundle_dir: str | Path,
+    *,
+    examples: list[dict[str, Any]] | None = None,
+    reference_checkpoint_dir: str | Path | None = None,
+    candidate_backend: str = "pytorch",
+    engine_path: str | Path | None = None,
+    num_examples: int = 8,
+    thresholds: dict[str, float] | None = None,
+    default_prompt: str | None = None,
+    pytorch_device: str | None = None,
+    reference_jax_platform: str = "cpu",
+    dataset_repo_id: str | None = None,
+    dataset_root: str | Path | None = None,
+) -> ValidationReport:
+    """Compare a PyTorch or TensorRT candidate against the JAX reference model."""
+
+    train_config = _resolve_train_config(config)
+    bundle = _resolve_bundle(bundle_dir, config_name=train_config.name)
+
+    if examples is None:
+        examples = sample_dataset_examples(
+            train_config,
+            num_examples=num_examples,
+            dataset_repo_id=dataset_repo_id,
+            dataset_root=dataset_root,
+        )
+
+    reference_policy, reference_path, reference_precision = _load_policy_for_backend(
+        train_config,
+        bundle,
+        backend="jax",
+        reference_checkpoint_dir=reference_checkpoint_dir,
+        default_prompt=default_prompt,
+        pytorch_device=pytorch_device,
+        reference_jax_platform=reference_jax_platform,
+    )
+    candidate_policy, candidate_path, candidate_precision = _load_policy_for_backend(
+        train_config,
+        bundle,
+        backend=candidate_backend,
+        engine_path=engine_path,
+        default_prompt=default_prompt,
+        pytorch_device=pytorch_device,
+        reference_jax_platform=reference_jax_platform,
+    )
+
+    thresholds = thresholds or _default_thresholds(
+        bundle,
+        candidate_backend,
+        reference_backend="jax",
+        reference_path=reference_path,
+        candidate_path=candidate_path,
+    )
+    report = _compare_policy_outputs(
+        train_config,
+        examples=examples,
+        reference_policy=reference_policy,
+        candidate_policy=candidate_policy,
+        reference_backend="jax",
+        candidate_backend=candidate_backend,
+        config_name=train_config.name,
+        reference_path=reference_path,
+        reference_precision=reference_precision,
+        candidate_path=candidate_path,
+        candidate_precision=candidate_precision,
+        thresholds=thresholds,
+    )
+
+    artifact_key = candidate_precision
+    validation_key = _validation_key(
+        candidate_backend,
+        candidate_path,
+        reference_backend="jax",
+        reference_path=reference_path,
+    )
+    _record_validation_report(
+        bundle,
+        report=report,
+        validation_key=validation_key,
+        artifact_key=artifact_key,
+        dataset_repo_id=dataset_repo_id,
+        dataset_root=dataset_root,
+    )
     if candidate_backend == "tensorrt" and report.passed and candidate_path is not None:
         bundle.set_recommended_engine(candidate_path, artifact_key=artifact_key)
+    bundle.save()
+    return report
+
+
+def compare_tensorrt_engines(
+    config: str | _config.TrainConfig,
+    bundle_dir: str | Path,
+    *,
+    candidate_engine_path: str | Path,
+    reference_engine_path: str | Path | None = None,
+    examples: list[dict[str, Any]] | None = None,
+    num_examples: int = 8,
+    thresholds: dict[str, float] | None = None,
+    default_prompt: str | None = None,
+    pytorch_device: str | None = None,
+    dataset_repo_id: str | None = None,
+    dataset_root: str | Path | None = None,
+) -> ValidationReport:
+    """Compare two TensorRT engines directly on the same fixed-noise dataset inputs."""
+
+    train_config = _resolve_train_config(config)
+    bundle = _resolve_bundle(bundle_dir, config_name=train_config.name)
+
+    if examples is None:
+        examples = sample_dataset_examples(
+            train_config,
+            num_examples=num_examples,
+            dataset_repo_id=dataset_repo_id,
+            dataset_root=dataset_root,
+        )
+
+    reference_policy, resolved_reference_path, reference_precision = _load_policy_for_backend(
+        train_config,
+        bundle,
+        backend="tensorrt",
+        engine_path=reference_engine_path,
+        default_prompt=default_prompt,
+        pytorch_device=pytorch_device,
+    )
+    candidate_policy, resolved_candidate_path, candidate_precision = _load_policy_for_backend(
+        train_config,
+        bundle,
+        backend="tensorrt",
+        engine_path=candidate_engine_path,
+        default_prompt=default_prompt,
+        pytorch_device=pytorch_device,
+    )
+
+    thresholds = thresholds or _default_thresholds(
+        bundle,
+        "tensorrt",
+        reference_backend="tensorrt",
+        reference_path=resolved_reference_path,
+        candidate_path=resolved_candidate_path,
+    )
+    report = _compare_policy_outputs(
+        train_config,
+        examples=examples,
+        reference_policy=reference_policy,
+        candidate_policy=candidate_policy,
+        reference_backend="tensorrt",
+        candidate_backend="tensorrt",
+        config_name=train_config.name,
+        reference_path=resolved_reference_path,
+        reference_precision=reference_precision,
+        candidate_path=resolved_candidate_path,
+        candidate_precision=candidate_precision,
+        thresholds=thresholds,
+    )
+
+    validation_key = _validation_key(
+        "tensorrt",
+        resolved_candidate_path,
+        reference_backend="tensorrt",
+        reference_path=resolved_reference_path,
+    )
+    _record_validation_report(
+        bundle,
+        report=report,
+        validation_key=validation_key,
+        artifact_key=candidate_precision,
+        dataset_repo_id=dataset_repo_id,
+        dataset_root=dataset_root,
+    )
     bundle.save()
     return report
