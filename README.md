@@ -194,6 +194,33 @@ openpi-thor serve \
   --port 8000
 ```
 
+Example startup output:
+
+```text
+============= TRT Engine Detail =============
+Engine file: /path/to/bundle/engine/model_fp16.engine
+Inputs: 6
+   0. images: 1x9x224x224 [torch.float16]
+   1. img_masks: 1x3 [torch.bool]
+   2. lang_tokens: 1x200 [torch.int64]
+   3. lang_masks: 1x200 [torch.bool]
+   4. state: 1x32 [torch.float32]
+   5. noise: 1x50x32 [torch.float32]
+Outputs: 1
+   0. actions: 1x50x32 [torch.float32]
+=============================================
+Attaching TensorRT engine /path/to/bundle/engine/model_fp16.engine
+TensorRT policy ready
+Starting websocket policy server on 0.0.0.0:8000
+server listening on 0.0.0.0:8000
+```
+
+The TensorRT input names shown above are the internal model tensors, not the raw robot-side API.
+From robot code, you still query the server through the same websocket interface described in the
+host `openpi` repo's `docs/remote_inference.md`: send an observation dictionary plus prompt, and
+let the server handle tokenization, image packing, normalization, and other preprocessing before
+the TensorRT engine runs.
+
 Replace `<PI05_TRAIN_CONFIG>` with the config name registered in your host `openpi` fork.
 
 ## Bundle directories
