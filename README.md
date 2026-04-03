@@ -112,6 +112,15 @@ Make sure `trtexec` is on `PATH`:
 export PATH=/usr/src/tensorrt/bin:$PATH
 ```
 
+For each new shell session, return to the local upstream `openpi` repo and reactivate the
+runtime venv before using `openpi-thor` again:
+
+```bash
+cd <OPENPI_REPO>
+source .venv-thor/bin/activate
+export PATH=/usr/src/tensorrt/bin:$PATH
+```
+
 ### 5. Verify the runtime
 
 ```bash
