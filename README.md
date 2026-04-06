@@ -1,15 +1,14 @@
 # openpi-thor
 
-Jetson AGX Thor deployment companion for OpenPI `pi05_*` models.
+`openpi-thor` is a Jetson AGX Thor deployment companion for OpenPI `pi05_*` models.
 
-`openpi-thor` is designed to live at `packages/openpi-thor` inside an `openpi` checkout. It
-provides a non-Docker Jetson AGX Thor path for:
+It is designed to live at `packages/openpi-thor` inside an `openpi` checkout and provides a
+non-Docker workflow for:
 
-- JAX checkpoint to PyTorch conversion
-- ONNX export
-- TensorRT engine build
-- JAX/PyTorch/TensorRT validation
-- websocket serving
+- converting JAX checkpoints into reusable PyTorch bundle directories
+- exporting ONNX and building TensorRT engines
+- validating PyTorch and TensorRT outputs against JAX or against another TensorRT engine
+- serving policies through the same websocket interface used by OpenPI
 
 The canonical user-facing interface is:
 
@@ -23,7 +22,15 @@ If you intentionally do not install the console script into the runtime venv, th
 python -m openpi_thor.cli ...
 ```
 
-## Before you start
+In practice, most users only need three commands after setup:
+
+- `openpi-thor convert-jax`
+- `openpi-thor prepare-engine`
+- `openpi-thor serve`
+
+Use `openpi-thor -h` or `openpi-thor <command> -h` for the full CLI reference.
+
+## Requirements
 
 `openpi-thor` assumes:
 
@@ -35,7 +42,7 @@ python -m openpi_thor.cli ...
 ## Quick start
 
 If you already have an `openpi` checkout on Jetson AGX Thor, this is the shortest path to a
-first FP16 TensorRT engine.
+first FP16 TensorRT engine and websocket policy server.
 
 ### 1. Put the package in the supported location
 
@@ -140,7 +147,7 @@ openpi-thor convert-jax \
   --bundle-dir /path/to/bundle
 ```
 
-### 7. Export ONNX and build a TensorRT engine
+### 7. Build a first TensorRT engine
 
 `prepare-engine` is the fastest path for first use. FP16 is the safest starting point.
 
@@ -223,6 +230,9 @@ the TensorRT engine runs.
 
 Replace `<PI05_TRAIN_CONFIG>` with the config name registered in your host `openpi` fork.
 
+If you need different build, validation, or integration patterns, use the reference sections
+below.
+
 ## Bundle directories
 
 A bundle directory is the working directory for one model across the whole deployment flow.
@@ -246,7 +256,7 @@ The remaining sections are reference material. Most first-time users can ignore 
 need a deeper explanation or a different workflow.
 
 <details>
-<summary>Command reference and common workflows</summary>
+<summary>Reference: commands and common workflows</summary>
 
 Use `openpi-thor -h` to list commands, or `openpi-thor <command> -h` / `--help` to show
 all arguments for one command.
@@ -355,7 +365,7 @@ So a validation report can exist and still block serving if it did not pass thos
 </details>
 
 <details>
-<summary>Why these defaults exist</summary>
+<summary>Reference: why the defaults look this way</summary>
 
 Two design choices in `openpi-thor` are deliberate departures from a naive “export everything in
 fp16” or “turn on broad NVFP4 everywhere” approach.
@@ -395,7 +405,7 @@ engine.
 </details>
 
 <details>
-<summary>Companion-repo integration details</summary>
+<summary>Reference: companion-repo integration</summary>
 
 The supported v1 companion-repo model assumes:
 
@@ -431,6 +441,43 @@ These source patches matter most for real-dataset flows, especially:
 - `openpi-thor validate-tensorrt`
 - any config with `prompt_from_task=True`
 
+If you want a single centralized host-side serving entrypoint, you can also patch the host
+repo's `scripts/serve_policy.py` to add a TensorRT-bundle mode that delegates to
+`openpi_thor.runtime.load_tensorrt_policy(...)`. That is enough to let one host script serve
+either:
+
+- a regular checkpoint-backed OpenPI policy
+- or an `openpi-thor` TensorRT bundle
+
+`openpi-thor serve` remains the canonical interface, but this optional patch can be convenient if
+you want one shared launcher in your host `openpi` fork.
+
+Minimal shape:
+
+```python
+@dataclasses.dataclass
+class TensorRTBundle:
+    config: str
+    bundle_dir: str
+    engine_path: str | None = None
+    require_validated: bool = True
+
+
+def create_policy(args: Args) -> _policy.Policy:
+    match args.policy:
+        case TensorRTBundle():
+            from openpi_thor.runtime import load_tensorrt_policy
+
+            return load_tensorrt_policy(
+                _config.get_config(args.policy.config),
+                args.policy.bundle_dir,
+                engine_path=args.policy.engine_path,
+                require_validated=args.policy.require_validated,
+                default_prompt=args.default_prompt,
+            )
+        # existing checkpoint/default cases stay unchanged
+```
+
 Manual fallback:
 
 - add those same `tool.uv.override-dependencies`, `tool.uv.conflicts`, and `tool.uv.sources`
@@ -458,7 +505,7 @@ except ImportError:
 </details>
 
 <details>
-<summary>Tested host and dependency matrix</summary>
+<summary>Reference: tested host and dependency matrix</summary>
 
 The package is intended to be portable across Jetson AGX Thor setups, but the current flow was
 tested on:
@@ -507,7 +554,7 @@ Important notes:
 </details>
 
 <details>
-<summary>Troubleshooting</summary>
+<summary>Reference: troubleshooting</summary>
 
 - If `torch.cuda.is_available()` becomes `False` after an install step, re-assert the tested
   Jetson AGX Thor PyTorch group.
