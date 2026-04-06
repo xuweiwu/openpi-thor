@@ -511,8 +511,10 @@ The package is intended to be portable across Jetson AGX Thor setups, but the cu
 tested on:
 
 - Ubuntu `24.04.4 LTS`
+- Python `3.12.3`
 - JetPack `7.0-b128`
 - L4T `38.2.2`
+- CUDA `13.0.48`
 
 Tested stack for the FP16 path:
 
