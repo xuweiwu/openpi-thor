@@ -6,8 +6,10 @@ import copy
 import contextlib
 import dataclasses
 import json
+import logging
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 from typing import Any
@@ -21,12 +23,15 @@ from openpi.training import config as _config
 from openpi_thor._schema import ArtifactBundle
 from openpi_thor._schema import EngineProfile
 from openpi_thor._schema import ExportOptions
+from openpi_thor._schema import _load_json_if_exists
 from openpi_thor.calibration import LeRobotPi05CalibrationSource
 from openpi_thor.calibration import _infer_device
 from openpi_thor.calibration import _prepare_policy_example
 from openpi_thor.calibration import build_calibration_batches
 from openpi_thor.calibration import sample_dataset_examples
 from openpi_thor.engine import _build_trtexec_command
+from openpi_thor.export import _NVFP4Experiment
+from openpi_thor.export import _current_public_nvfp4_experiment
 from openpi_thor.export import export_to_onnx_bundle
 from openpi_thor.export import patch_model_for_export
 from openpi_thor.export import prepare_model_for_export_precision
@@ -37,6 +42,8 @@ from openpi_thor.runtime import load_pytorch_bundle
 from openpi_thor.validate import compare_backends
 from openpi_thor.validate import compare_tensorrt_engines
 from openpi_thor.validate import _artifact_precision_from_path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -78,6 +85,74 @@ _TORCH_MODULE_STAGE_SPECS: tuple[tuple[str, str], ...] = (
     ("down_proj", "paligemma_with_expert.paligemma.model.language_model.layers.{layer}.mlp.down_proj"),
     ("layer_output", "paligemma_with_expert.paligemma.model.language_model.layers.{layer}"),
 )
+
+
+@dataclasses.dataclass(frozen=True)
+class _ExperimentCandidate:
+    """One internal NVFP4 investigation candidate."""
+
+    name: str
+    description: str
+    nvfp4_experiment: _NVFP4Experiment | None
+    quantize_attention_matmul: bool = False
+    existing_artifact_key: str | None = None
+
+
+def _full_mlp_candidate(*layers: int) -> _ExperimentCandidate:
+    layer_tuple = tuple(layers)
+    return _ExperimentCandidate(
+        name=f"full_mlp_l{'_'.join(str(layer) for layer in layer_tuple)}",
+        description=f"Selective full W4A4 on Gemma MLP layer(s) {layer_tuple}",
+        nvfp4_experiment=_NVFP4Experiment(full_mlp_layers=layer_tuple),
+    )
+
+
+def _full_attention_candidate(*layers: int) -> _ExperimentCandidate:
+    layer_tuple = tuple(layers)
+    return _ExperimentCandidate(
+        name=f"full_attention_l{'_'.join(str(layer) for layer in layer_tuple)}",
+        description=f"Selective full W4A4 on Gemma attention layer(s) {layer_tuple}",
+        nvfp4_experiment=_NVFP4Experiment(
+            full_attention_layers=layer_tuple,
+            quantize_attention_matmul=True,
+        ),
+        quantize_attention_matmul=True,
+    )
+
+
+def _combined_candidate(mlp_layers: tuple[int, ...], attention_layers: tuple[int, ...]) -> _ExperimentCandidate:
+    return _ExperimentCandidate(
+        name=(
+            f"full_mlp_and_attention__mlp_l{'_'.join(str(layer) for layer in mlp_layers)}"
+            f"__attn_l{'_'.join(str(layer) for layer in attention_layers)}"
+        ),
+        description=(
+            "Selective full W4A4 on Gemma MLP and attention layers "
+            f"(mlp={mlp_layers}, attention={attention_layers})"
+        ),
+        nvfp4_experiment=_NVFP4Experiment(
+            full_mlp_layers=mlp_layers,
+            full_attention_layers=attention_layers,
+            quantize_attention_matmul=True,
+        ),
+        quantize_attention_matmul=True,
+    )
+
+
+def _candidate_target_layers(candidate: _ExperimentCandidate) -> tuple[int, ...]:
+    if candidate.nvfp4_experiment is None:
+        return ()
+    layers = []
+    layers.extend(candidate.nvfp4_experiment.full_mlp_layers)
+    layers.extend(candidate.nvfp4_experiment.full_attention_layers)
+    return tuple(sorted(dict.fromkeys(layers)))
+
+
+def _candidate_debug_layers(candidate: _ExperimentCandidate) -> range:
+    layers = _candidate_target_layers(candidate)
+    if not layers:
+        return range(5)
+    return range(min(layers), max(layers) + 1)
 
 
 def _resolve_train_config(config: str | _config.TrainConfig) -> _config.TrainConfig:
@@ -352,6 +427,7 @@ def _prepare_quantized_debug_model(
     num_calibration_samples: int,
     dataset_repo_id: str | None,
     dataset_root: str | Path | None,
+    nvfp4_experiment: _NVFP4Experiment | None = None,
 ) -> tuple[torch.nn.Module, Any, dict[str, Any]]:
     """Build one quantized PyTorch model that mirrors the export-time fp8/NVFP4 path."""
 
@@ -378,10 +454,12 @@ def _prepare_quantized_debug_model(
         num_steps=bundle.num_steps or 10,
         enable_llm_nvfp4=enable_llm_nvfp4,
         quantize_attention_matmul=quantize_attention_matmul,
+        nvfp4_experiment=nvfp4_experiment,
     )
     return quantized_model, policy._input_transform, {
         "calibration_source": calibration_source.name,
         "calibration_num_samples": len(calibration_batches),
+        "nvfp4_experiment": nvfp4_experiment.label() if nvfp4_experiment is not None else None,
     }
 
 
@@ -394,6 +472,8 @@ def _run_quantized_torch_stage_debug(
     material_relative_l2_threshold: float,
     dataset_repo_id: str | None,
     dataset_root: str | Path | None,
+    candidate_experiment: _NVFP4Experiment | None = None,
+    candidate_quantize_attention_matmul: bool = True,
 ) -> dict[str, Any]:
     """Compare fp8 and fp8+NVFP4 inside the quantized PyTorch prefix language-model modules."""
 
@@ -417,11 +497,12 @@ def _run_quantized_torch_stage_debug(
     nvfp4_model, nvfp4_input_transform, nvfp4_meta = _prepare_quantized_debug_model(
         train_config,
         bundle,
-        enable_llm_nvfp4=True,
-        quantize_attention_matmul=True,
+        enable_llm_nvfp4=candidate_experiment is not None,
+        quantize_attention_matmul=candidate_quantize_attention_matmul,
         num_calibration_samples=calibration_num_samples,
         dataset_repo_id=dataset_repo_id,
         dataset_root=dataset_root,
+        nvfp4_experiment=candidate_experiment or _current_public_nvfp4_experiment(),
     )
 
     def capture_stage_outputs(model: torch.nn.Module, input_transform) -> tuple[dict[str, np.ndarray], torch.Tensor]:
@@ -497,6 +578,8 @@ def run_fp8_nvfp4_debug(
     layers: range = range(5),
     material_relative_l2_threshold: float = 0.05,
     compare_with_tensorrt: bool = False,
+    candidate_experiment: _NVFP4Experiment | None = None,
+    candidate_quantize_attention_matmul: bool = True,
 ) -> Path:
     """Compare fp8 and fp8+NVFP4 internal layer tensors and write a debug report."""
 
@@ -534,6 +617,8 @@ def run_fp8_nvfp4_debug(
         material_relative_l2_threshold=material_relative_l2_threshold,
         dataset_repo_id=dataset_repo_id,
         dataset_root=dataset_root,
+        candidate_experiment=candidate_experiment,
+        candidate_quantize_attention_matmul=candidate_quantize_attention_matmul,
     )
 
     tensorrt_debug: dict[str, Any] | None = None
@@ -782,4 +867,704 @@ def run_fp8_calibration_sweep(
     }
     report_path = bundle.write_report("fp8_calibration_sweep", payload, report_key="sweep:fp8_calibration")
     bundle.save()
+    return report_path
+
+
+_GPU_COMPUTE_MEAN_RE = re.compile(r"GPU Compute Time:.*?mean\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*ms")
+_THROUGHPUT_RE = re.compile(r"Throughput:\s*([0-9]+(?:\.[0-9]+)?)\s*qps")
+
+
+def _parse_trtexec_stdout(stdout: str) -> dict[str, float | None]:
+    """Extract the high-signal performance numbers from trtexec stdout."""
+
+    mean_gpu_compute_ms = None
+    throughput_qps = None
+    if match := _GPU_COMPUTE_MEAN_RE.search(stdout):
+        mean_gpu_compute_ms = float(match.group(1))
+    if match := _THROUGHPUT_RE.search(stdout):
+        throughput_qps = float(match.group(1))
+    return {
+        "mean_gpu_compute_ms": mean_gpu_compute_ms,
+        "throughput_qps": throughput_qps,
+    }
+
+
+def _load_trtexec_profile_rows(profile_path: Path) -> list[dict[str, Any]]:
+    """Load per-layer profile rows from TensorRT's exported JSON."""
+
+    payload = json.loads(profile_path.read_text())
+    if not isinstance(payload, list):
+        raise TypeError(f"Unexpected trtexec profile format: {type(payload)!r}")
+    rows: list[dict[str, Any]] = []
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        if "averageMs" not in entry or "name" not in entry:
+            continue
+        rows.append(
+            {
+                "name": str(entry["name"]),
+                "averageMs": float(entry["averageMs"]),
+                "medianMs": float(entry.get("medianMs", 0.0)),
+                "percentage": float(entry.get("percentage", 0.0)),
+            }
+        )
+    return rows
+
+
+def _summarize_trtexec_profile_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize the hottest TensorRT layers and cast-heavy overhead."""
+
+    total_average_ms = float(sum(float(row["averageMs"]) for row in rows))
+    sorted_rows = sorted(rows, key=lambda row: float(row["averageMs"]), reverse=True)
+    repl_cast_rows = [row for row in rows if "ReplCastMulCast" in str(row["name"])]
+    fused_mha_rows = [row for row in rows if "_gemm_mha" in str(row["name"])]
+    repl_cast_average_ms = float(sum(float(row["averageMs"]) for row in repl_cast_rows))
+    fused_mha_average_ms = float(sum(float(row["averageMs"]) for row in fused_mha_rows))
+    repl_cast_fraction = 0.0 if total_average_ms == 0.0 else repl_cast_average_ms / total_average_ms
+    return {
+        "num_profiled_layers": len(rows),
+        "total_average_ms": total_average_ms,
+        "top_layers": sorted_rows[:15],
+        "repl_cast_mul_cast_count": len(repl_cast_rows),
+        "repl_cast_mul_cast_total_average_ms": repl_cast_average_ms,
+        "repl_cast_mul_cast_fraction": repl_cast_fraction,
+        "fused_mha_count": len(fused_mha_rows),
+        "fused_mha_total_average_ms": fused_mha_average_ms,
+        "cast_dominated": repl_cast_fraction >= 0.25 or (
+            bool(sorted_rows) and "ReplCastMulCast" in str(sorted_rows[0]["name"])
+        ),
+    }
+
+
+def _profile_engine_with_trtexec(engine_path: Path) -> dict[str, Any]:
+    """Benchmark one built TensorRT engine and summarize the hot layers."""
+
+    profile_path = engine_path.with_suffix(".profile.json")
+    command = [
+        "trtexec",
+        f"--loadEngine={engine_path}",
+        "--iterations=20",
+        "--warmUp=200",
+        "--duration=0",
+        "--streams=1",
+        "--useCudaGraph",
+        "--noDataTransfers",
+        "--separateProfileRun",
+        "--dumpProfile",
+        f"--exportProfile={profile_path}",
+    ]
+    env = os.environ.copy()
+    env.setdefault("APPORT_DISABLE", "1")
+    completed = subprocess.run(
+        command,
+        check=True,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=1800,
+    )
+    stdout_metrics = _parse_trtexec_stdout(completed.stdout)
+    profile_rows = _load_trtexec_profile_rows(profile_path)
+    summary = _summarize_trtexec_profile_rows(profile_rows)
+    summary.update(stdout_metrics)
+    summary["trtexec_command"] = command
+    return summary
+
+
+def _safe_ratio(candidate: float | None, baseline: float | None) -> float | None:
+    if candidate is None or baseline is None or baseline == 0.0:
+        return None
+    return float(candidate) / float(baseline)
+
+
+def _acceptance_summary(
+    *,
+    candidate_jax_report: dict[str, Any],
+    baseline_jax_report: dict[str, Any],
+    candidate_profile: dict[str, Any],
+    baseline_profile: dict[str, Any],
+) -> dict[str, Any]:
+    """Evaluate one candidate against the fp8 baseline acceptance bar."""
+
+    mean_ratio = _safe_ratio(candidate_jax_report.get("mean_abs_error"), baseline_jax_report.get("mean_abs_error"))
+    max_ratio = _safe_ratio(candidate_jax_report.get("max_abs_error"), baseline_jax_report.get("max_abs_error"))
+    speed_ratio = _safe_ratio(candidate_profile.get("mean_gpu_compute_ms"), baseline_profile.get("mean_gpu_compute_ms"))
+    speedup_fraction = None if speed_ratio is None else 1.0 - speed_ratio
+    meets_accuracy = bool(mean_ratio is not None and max_ratio is not None and mean_ratio <= 1.05 and max_ratio <= 1.05)
+    meets_speed = bool(speed_ratio is not None and speed_ratio <= 0.95)
+    not_slower_than_fp8 = bool(speed_ratio is not None and speed_ratio <= 1.0)
+    cast_dominated = bool(candidate_profile.get("cast_dominated", False))
+    return {
+        "mean_abs_error_ratio_vs_fp8_jax": mean_ratio,
+        "max_abs_error_ratio_vs_fp8_jax": max_ratio,
+        "speed_ratio_vs_fp8": speed_ratio,
+        "speedup_fraction_vs_fp8": speedup_fraction,
+        "meets_accuracy_goal": meets_accuracy,
+        "meets_speed_goal": meets_speed,
+        "meets_acceptance": meets_accuracy and meets_speed,
+        "eligible_for_scope_expansion": meets_accuracy and not_slower_than_fp8 and not cast_dominated,
+        "pruned": cast_dominated or bool(speed_ratio is not None and speed_ratio > 1.10) or not meets_accuracy,
+        "cast_dominated": cast_dominated,
+    }
+
+
+def _candidate_detail_payload(
+    *,
+    candidate: _ExperimentCandidate,
+    num_steps: int,
+    sample_count: int,
+    export_report: dict[str, Any] | None,
+    build_report: dict[str, Any] | None,
+    profile_summary: dict[str, Any] | None,
+    jax_report: dict[str, Any] | None,
+    fp8_report: dict[str, Any] | None,
+    graph_qdq_summary: dict[str, Any] | None,
+    torch_debug: dict[str, Any] | None,
+    acceptance: dict[str, Any] | None,
+    reused_existing_artifact: str | None = None,
+    error: Exception | None = None,
+) -> dict[str, Any]:
+    return {
+        "phase": "nvfp4_efficiency_candidate",
+        "candidate": {
+            "name": candidate.name,
+            "description": candidate.description,
+            "nvfp4_experiment": (
+                candidate.nvfp4_experiment.manifest_extra() if candidate.nvfp4_experiment is not None else None
+            ),
+            "quantize_attention_matmul": candidate.quantize_attention_matmul,
+            "existing_artifact_key": candidate.existing_artifact_key,
+        },
+        "num_steps": num_steps,
+        "calibration_num_samples": sample_count,
+        "reused_existing_artifact": reused_existing_artifact,
+        "export_report": export_report,
+        "build_report": build_report,
+        "profile_summary": profile_summary,
+        "jax_report": jax_report,
+        "fp8_report": fp8_report,
+        "graph_qdq_summary": graph_qdq_summary,
+        "torch_debug": torch_debug,
+        "acceptance": acceptance,
+        "error": None if error is None else {"type": type(error).__name__, "message": str(error)},
+    }
+
+
+def _best_viable_candidate(results: list[dict[str, Any]]) -> dict[str, Any] | None:
+    viable = [result for result in results if result.get("acceptance", {}).get("eligible_for_scope_expansion")]
+    if not viable:
+        return None
+    return min(
+        viable,
+        key=lambda result: (
+            result["acceptance"].get("speed_ratio_vs_fp8", float("inf")),
+            result["acceptance"].get("mean_abs_error_ratio_vs_fp8_jax", float("inf")),
+            result["acceptance"].get("max_abs_error_ratio_vs_fp8_jax", float("inf")),
+        ),
+    )
+
+
+def _resolve_existing_artifact_paths(
+    bundle: ArtifactBundle,
+    artifact_key: str,
+    *,
+    sample_count: int,
+    num_steps: int,
+    quantize_attention_matmul: bool,
+    enable_llm_nvfp4: bool,
+) -> tuple[Path, Path] | None:
+    """Return reusable ONNX/engine paths when the source bundle already matches the candidate."""
+
+    artifact = bundle.artifacts.get(artifact_key)
+    if artifact is None or artifact.onnx_path is None or not artifact.engine_paths:
+        return None
+    if artifact.num_steps not in (None, num_steps):
+        return None
+    if enable_llm_nvfp4:
+        if artifact.calibration_num_samples not in (None, sample_count):
+            return None
+    export_options = artifact.export_options
+    if export_options:
+        if bool(export_options.get("enable_llm_nvfp4", False)) != enable_llm_nvfp4:
+            return None
+        if bool(export_options.get("quantize_attention_matmul", False)) != quantize_attention_matmul:
+            return None
+        if export_options.get("num_steps") not in (None, num_steps):
+            return None
+        if enable_llm_nvfp4 and export_options.get("num_calibration_samples") not in (None, sample_count):
+            return None
+
+    onnx_path = Path(artifact.onnx_path)
+    engine_path_str = artifact.recommended_engine_path
+    if engine_path_str is None:
+        preferred_engine_stem = onnx_path.stem
+        engine_path_str = artifact.engine_paths.get(preferred_engine_stem)
+    if engine_path_str is None:
+        engine_path_str = next(iter(sorted(artifact.engine_paths.items())))[1]
+    engine_path = Path(engine_path_str)
+    if not onnx_path.exists() or not engine_path.exists():
+        return None
+    return onnx_path, engine_path
+
+
+def _resolve_existing_candidate_bundle_state(
+    bundle_dir: Path,
+    artifact_key: str,
+) -> tuple[ArtifactBundle, Path, Path | None] | None:
+    """Reuse a partially completed candidate bundle when its export already exists."""
+
+    metadata_path = bundle_dir / "openpi_thor_bundle.json"
+    if not metadata_path.exists():
+        return None
+    bundle = ArtifactBundle.load(bundle_dir)
+    artifact = bundle.artifacts.get(artifact_key)
+    if artifact is None or artifact.onnx_path is None:
+        return None
+    onnx_path = Path(artifact.onnx_path)
+    if not onnx_path.exists():
+        return None
+
+    preferred_engine_path: Path | None = None
+    candidate_engine_stem = onnx_path.stem
+    if candidate_engine_stem in artifact.engine_paths:
+        preferred_engine_path = Path(artifact.engine_paths[candidate_engine_stem])
+    elif artifact.recommended_engine_path is not None:
+        preferred_engine_path = Path(artifact.recommended_engine_path)
+    else:
+        for engine_ref in artifact.engine_paths.values():
+            preferred_engine_path = Path(engine_ref)
+            break
+
+    if preferred_engine_path is not None:
+        if not preferred_engine_path.exists() or preferred_engine_path.stat().st_size == 0:
+            preferred_engine_path = None
+
+    return bundle, onnx_path, preferred_engine_path
+
+
+def _run_efficiency_candidate(
+    train_config: _config.TrainConfig,
+    source_bundle: ArtifactBundle,
+    *,
+    workspace_root: Path,
+    candidate: _ExperimentCandidate,
+    num_steps: int,
+    sample_count: int,
+    examples: list[dict[str, Any]],
+    reference_checkpoint_dir: str | Path,
+    baseline_onnx_path: Path | None,
+    baseline_engine_path: Path | None,
+    baseline_jax_report: dict[str, Any] | None,
+    baseline_profile: dict[str, Any] | None,
+    dataset_repo_id: str | None,
+    dataset_root: str | Path | None,
+) -> dict[str, Any]:
+    """Export, build, profile, and validate one internal NVFP4 candidate."""
+
+    candidate_bundle_dir = workspace_root / candidate.name
+    _initialize_sweep_bundle(source_bundle, candidate_bundle_dir)
+    artifact_key = "fp8_nvfp4" if candidate.nvfp4_experiment is not None else "fp8"
+    export_report = None
+    build_report = None
+    profile_summary = None
+    jax_report = None
+    fp8_report = None
+    graph_qdq_summary = None
+    torch_debug = None
+    acceptance = None
+    error = None
+    reused_existing_artifact = None
+
+    try:
+        existing_artifact_paths = None
+        if candidate.existing_artifact_key is not None:
+            existing_artifact_paths = _resolve_existing_artifact_paths(
+                source_bundle,
+                candidate.existing_artifact_key,
+                sample_count=sample_count,
+                num_steps=num_steps,
+                quantize_attention_matmul=candidate.quantize_attention_matmul,
+                enable_llm_nvfp4=candidate.nvfp4_experiment is not None,
+            )
+
+        if existing_artifact_paths is not None:
+            onnx_path, engine_path = existing_artifact_paths
+            reused_existing_artifact = candidate.existing_artifact_key
+            artifact = source_bundle.artifacts[candidate.existing_artifact_key]
+            export_report_ref = artifact.report_paths.get("export")
+            if export_report_ref is not None:
+                export_report = _load_json_if_exists(source_bundle.resolve_report_path(export_report_ref))
+            build_report_ref = artifact.report_paths.get(f"build:{onnx_path.stem}")
+            if build_report_ref is not None:
+                build_report = _load_json_if_exists(source_bundle.resolve_report_path(build_report_ref))
+            compare_bundle_dir = source_bundle.bundle_dir
+        else:
+            from openpi_thor.engine import build_engine
+
+            existing_candidate_state = _resolve_existing_candidate_bundle_state(candidate_bundle_dir, artifact_key)
+            if existing_candidate_state is not None:
+                temp_bundle, onnx_path, engine_path = existing_candidate_state
+            else:
+                temp_bundle = export_to_onnx_bundle(
+                    train_config,
+                    candidate_bundle_dir,
+                    options=ExportOptions(
+                        precision="fp8",
+                        num_steps=num_steps,
+                        enable_llm_nvfp4=candidate.nvfp4_experiment is not None,
+                        quantize_attention_matmul=candidate.quantize_attention_matmul,
+                        num_calibration_samples=sample_count,
+                        allow_dummy_calibration=False,
+                    ),
+                    dataset_repo_id=dataset_repo_id,
+                    dataset_root=dataset_root,
+                    nvfp4_experiment=candidate.nvfp4_experiment,
+                )
+                onnx_path = Path(temp_bundle.onnx_paths[artifact_key])
+                engine_path = None
+
+            if engine_path is None:
+                built_bundle = build_engine(
+                    train_config,
+                    candidate_bundle_dir,
+                    onnx_path=onnx_path,
+                    profile=EngineProfile(strongly_typed=True),
+                )
+                engine_path = Path(built_bundle.engine_paths[onnx_path.stem])
+
+            temp_bundle = ArtifactBundle.load(candidate_bundle_dir)
+            artifact = temp_bundle.artifacts[artifact_key]
+            export_report_ref = artifact.report_paths.get("export")
+            if export_report_ref is not None:
+                export_report = _load_json_if_exists(temp_bundle.resolve_report_path(export_report_ref))
+            build_report_ref = artifact.report_paths.get(f"build:{onnx_path.stem}")
+            if build_report_ref is not None:
+                build_report = _load_json_if_exists(temp_bundle.resolve_report_path(build_report_ref))
+            compare_bundle_dir = candidate_bundle_dir
+
+        profile_summary = _profile_engine_with_trtexec(engine_path)
+        jax_validation = compare_backends(
+            train_config,
+            compare_bundle_dir,
+            examples=examples,
+            reference_checkpoint_dir=reference_checkpoint_dir,
+            candidate_backend="tensorrt",
+            engine_path=engine_path,
+            dataset_repo_id=dataset_repo_id,
+            dataset_root=dataset_root,
+        )
+        jax_report = jax_validation.to_dict()
+        if baseline_engine_path is not None and engine_path != baseline_engine_path:
+            fp8_validation = compare_tensorrt_engines(
+                train_config,
+                compare_bundle_dir,
+                candidate_engine_path=engine_path,
+                reference_engine_path=baseline_engine_path,
+                examples=examples,
+                dataset_repo_id=dataset_repo_id,
+                dataset_root=dataset_root,
+            )
+            fp8_report = fp8_validation.to_dict()
+
+        if baseline_onnx_path is not None and candidate.nvfp4_experiment is not None:
+            debug_layers = _candidate_debug_layers(candidate)
+            fp8_qdq_summary = _qdq_summary(baseline_onnx_path, layers=debug_layers)
+            candidate_qdq_summary = _qdq_summary(onnx_path, layers=debug_layers)
+            graph_qdq_summary = {
+                "baseline_fp8": fp8_qdq_summary,
+                "candidate": candidate_qdq_summary,
+                "first_qdq_difference": _first_qdq_difference(
+                    fp8_qdq_summary,
+                    candidate_qdq_summary,
+                    layers=debug_layers,
+                ),
+            }
+            torch_debug = _run_quantized_torch_stage_debug(
+                train_config,
+                source_bundle,
+                example=examples[0],
+                layers=debug_layers,
+                material_relative_l2_threshold=0.05,
+                dataset_repo_id=dataset_repo_id,
+                dataset_root=dataset_root,
+                candidate_experiment=candidate.nvfp4_experiment,
+                candidate_quantize_attention_matmul=candidate.quantize_attention_matmul,
+            )
+
+        if baseline_jax_report is not None and baseline_profile is not None:
+            acceptance = _acceptance_summary(
+                candidate_jax_report=jax_report,
+                baseline_jax_report=baseline_jax_report,
+                candidate_profile=profile_summary,
+                baseline_profile=baseline_profile,
+            )
+    except Exception as exc:  # noqa: BLE001
+        error = exc
+        logger.info("NVFP4 candidate %s failed: %s", candidate.name, exc)
+
+    detail_payload = _candidate_detail_payload(
+        candidate=candidate,
+        num_steps=num_steps,
+        sample_count=sample_count,
+        export_report=export_report,
+        build_report=build_report,
+        profile_summary=profile_summary,
+        jax_report=jax_report,
+        fp8_report=fp8_report,
+        graph_qdq_summary=graph_qdq_summary,
+        torch_debug=torch_debug,
+        acceptance=acceptance,
+        reused_existing_artifact=reused_existing_artifact,
+        error=error,
+    )
+    detail_report_path = source_bundle.write_report(f"nvfp4_efficiency_{candidate.name}", detail_payload)
+    summary = {
+        "name": candidate.name,
+        "description": candidate.description,
+        "detail_report_path": str(detail_report_path),
+        "profile_summary": profile_summary,
+        "jax_report": jax_report,
+        "fp8_report": fp8_report,
+        "acceptance": acceptance,
+        "failure_class": None if error is None else type(error).__name__,
+        "reused_existing_artifact": reused_existing_artifact,
+    }
+    if candidate.nvfp4_experiment is not None:
+        summary["nvfp4_experiment"] = candidate.nvfp4_experiment.manifest_extra()
+    return summary
+
+
+def run_nvfp4_efficiency_sweep(
+    config: str | _config.TrainConfig,
+    bundle_dir: str | Path,
+    *,
+    reference_checkpoint_dir: str | Path,
+    sample_count: int = 32,
+    validation_num_examples: int = 8,
+    dataset_repo_id: str | None = None,
+    dataset_root: str | Path | None = None,
+) -> Path:
+    """Run the internal NVFP4 efficiency investigation sweep against fp8 and JAX."""
+
+    train_config = _resolve_train_config(config)
+    source_bundle = _resolve_bundle(bundle_dir, config_name=train_config.name)
+    examples = sample_dataset_examples(
+        train_config,
+        num_examples=validation_num_examples,
+        dataset_repo_id=dataset_repo_id,
+        dataset_root=dataset_root,
+    )
+    num_steps = (
+        source_bundle.artifacts.get("fp8").num_steps
+        if source_bundle.artifacts.get("fp8") and source_bundle.artifacts["fp8"].num_steps is not None
+        else source_bundle.num_steps or 10
+    )
+    results: list[dict[str, Any]] = []
+
+    baseline_candidate = _ExperimentCandidate(
+        name="fp8_baseline",
+        description="Pure fp8 baseline without NVFP4",
+        nvfp4_experiment=None,
+        quantize_attention_matmul=False,
+        existing_artifact_key="fp8",
+    )
+    current_control_candidate = _ExperimentCandidate(
+        name="public_attention_current",
+        description="Current public NVFP4 control: all Gemma attention layers plus attention-matmul QDQ",
+        nvfp4_experiment=_current_public_nvfp4_experiment(),
+        quantize_attention_matmul=True,
+        existing_artifact_key="fp8_nvfp4",
+    )
+
+    with tempfile.TemporaryDirectory(prefix=f"{source_bundle.bundle_dir.name}_nvfp4_", dir=source_bundle.bundle_dir.parent) as tmpdir:
+        workspace_root = Path(tmpdir)
+        baseline_result = _run_efficiency_candidate(
+            train_config,
+            source_bundle,
+            workspace_root=workspace_root,
+            candidate=baseline_candidate,
+            num_steps=num_steps,
+            sample_count=sample_count,
+            examples=examples,
+            reference_checkpoint_dir=reference_checkpoint_dir,
+            baseline_onnx_path=None,
+            baseline_engine_path=None,
+            baseline_jax_report=None,
+            baseline_profile=None,
+            dataset_repo_id=dataset_repo_id,
+            dataset_root=dataset_root,
+        )
+        results.append(baseline_result)
+        if baseline_result["jax_report"] is None or baseline_result["profile_summary"] is None:
+            raise RuntimeError("The fp8 baseline failed, so the NVFP4 efficiency sweep cannot continue.")
+
+        baseline_paths = None
+        if baseline_candidate.existing_artifact_key is not None:
+            baseline_paths = _resolve_existing_artifact_paths(
+                source_bundle,
+                baseline_candidate.existing_artifact_key,
+                sample_count=sample_count,
+                num_steps=num_steps,
+                quantize_attention_matmul=baseline_candidate.quantize_attention_matmul,
+                enable_llm_nvfp4=baseline_candidate.nvfp4_experiment is not None,
+            )
+        if baseline_paths is not None:
+            baseline_onnx_path, baseline_engine_path = baseline_paths
+        else:
+            baseline_bundle = ArtifactBundle.load(workspace_root / baseline_candidate.name)
+            baseline_onnx_path = Path(baseline_bundle.onnx_paths["fp8"])
+            baseline_engine_path = Path(baseline_bundle.engine_paths[baseline_onnx_path.stem])
+        baseline_jax_report = baseline_result["jax_report"]
+        baseline_profile = baseline_result["profile_summary"]
+
+        current_control_result = _run_efficiency_candidate(
+            train_config,
+            source_bundle,
+            workspace_root=workspace_root,
+            candidate=current_control_candidate,
+            num_steps=num_steps,
+            sample_count=sample_count,
+            examples=examples,
+            reference_checkpoint_dir=reference_checkpoint_dir,
+            baseline_onnx_path=baseline_onnx_path,
+            baseline_engine_path=baseline_engine_path,
+            baseline_jax_report=baseline_jax_report,
+            baseline_profile=baseline_profile,
+            dataset_repo_id=dataset_repo_id,
+            dataset_root=dataset_root,
+        )
+        results.append(current_control_result)
+
+        mlp_candidates = [_full_mlp_candidate(16), _full_mlp_candidate(17)]
+        mlp_results = []
+        for candidate in mlp_candidates:
+            result = _run_efficiency_candidate(
+                train_config,
+                source_bundle,
+                workspace_root=workspace_root,
+                candidate=candidate,
+                num_steps=num_steps,
+                sample_count=sample_count,
+                examples=examples,
+                reference_checkpoint_dir=reference_checkpoint_dir,
+                baseline_onnx_path=baseline_onnx_path,
+                baseline_engine_path=baseline_engine_path,
+                baseline_jax_report=baseline_jax_report,
+                baseline_profile=baseline_profile,
+                dataset_repo_id=dataset_repo_id,
+                dataset_root=dataset_root,
+            )
+            mlp_results.append(result)
+            results.append(result)
+
+        if all(result.get("acceptance", {}).get("eligible_for_scope_expansion") for result in mlp_results):
+            mlp_combo_result = _run_efficiency_candidate(
+                train_config,
+                source_bundle,
+                workspace_root=workspace_root,
+                candidate=_full_mlp_candidate(16, 17),
+                num_steps=num_steps,
+                sample_count=sample_count,
+                examples=examples,
+                reference_checkpoint_dir=reference_checkpoint_dir,
+                baseline_onnx_path=baseline_onnx_path,
+                baseline_engine_path=baseline_engine_path,
+                baseline_jax_report=baseline_jax_report,
+                baseline_profile=baseline_profile,
+                dataset_repo_id=dataset_repo_id,
+                dataset_root=dataset_root,
+            )
+            mlp_results.append(mlp_combo_result)
+            results.append(mlp_combo_result)
+
+        attention_candidates = [_full_attention_candidate(16), _full_attention_candidate(17)]
+        attention_results = []
+        for candidate in attention_candidates:
+            result = _run_efficiency_candidate(
+                train_config,
+                source_bundle,
+                workspace_root=workspace_root,
+                candidate=candidate,
+                num_steps=num_steps,
+                sample_count=sample_count,
+                examples=examples,
+                reference_checkpoint_dir=reference_checkpoint_dir,
+                baseline_onnx_path=baseline_onnx_path,
+                baseline_engine_path=baseline_engine_path,
+                baseline_jax_report=baseline_jax_report,
+                baseline_profile=baseline_profile,
+                dataset_repo_id=dataset_repo_id,
+                dataset_root=dataset_root,
+            )
+            attention_results.append(result)
+            results.append(result)
+
+        if all(result.get("acceptance", {}).get("eligible_for_scope_expansion") for result in attention_results):
+            attention_combo_result = _run_efficiency_candidate(
+                train_config,
+                source_bundle,
+                workspace_root=workspace_root,
+                candidate=_full_attention_candidate(16, 17),
+                num_steps=num_steps,
+                sample_count=sample_count,
+                examples=examples,
+                reference_checkpoint_dir=reference_checkpoint_dir,
+                baseline_onnx_path=baseline_onnx_path,
+                baseline_engine_path=baseline_engine_path,
+                baseline_jax_report=baseline_jax_report,
+                baseline_profile=baseline_profile,
+                dataset_repo_id=dataset_repo_id,
+                dataset_root=dataset_root,
+            )
+            attention_results.append(attention_combo_result)
+            results.append(attention_combo_result)
+
+        best_mlp = _best_viable_candidate(mlp_results)
+        best_attention = _best_viable_candidate(attention_results)
+        if best_mlp is not None and best_attention is not None:
+            combined_result = _run_efficiency_candidate(
+                train_config,
+                source_bundle,
+                workspace_root=workspace_root,
+                candidate=_combined_candidate(
+                    tuple(best_mlp["nvfp4_experiment"]["nvfp4_full_mlp_layers"]),
+                    tuple(best_attention["nvfp4_experiment"]["nvfp4_full_attention_layers"]),
+                ),
+                num_steps=num_steps,
+                sample_count=sample_count,
+                examples=examples,
+                reference_checkpoint_dir=reference_checkpoint_dir,
+                baseline_onnx_path=baseline_onnx_path,
+                baseline_engine_path=baseline_engine_path,
+                baseline_jax_report=baseline_jax_report,
+                baseline_profile=baseline_profile,
+                dataset_repo_id=dataset_repo_id,
+                dataset_root=dataset_root,
+            )
+            results.append(combined_result)
+
+    payload = {
+        "phase": "nvfp4_efficiency_sweep",
+        "bundle_dir": str(source_bundle.bundle_dir),
+        "reference_checkpoint_dir": str(Path(reference_checkpoint_dir).expanduser().resolve()),
+        "calibration_num_samples": sample_count,
+        "validation_num_examples": validation_num_examples,
+        "num_steps": num_steps,
+        "dataset_indices": [int(np.asarray(example["dataset_index"]).item()) for example in examples],
+        "acceptance_criteria": {
+            "mean_gpu_compute_speedup_vs_fp8": ">= 5%",
+            "mean_abs_error_ratio_vs_fp8_jax": "<= 1.05",
+            "max_abs_error_ratio_vs_fp8_jax": "<= 1.05",
+        },
+        "results": results,
+        "notes": [
+            "The public --enable-llm-nvfp4 path stays unchanged during this investigation.",
+            "Candidate profiles are pruned when they become cast-dominated or exceed the JAX error ratio guardrail.",
+            "Pure fp8 remains the comparison baseline for both TensorRT speed and JAX drift.",
+        ],
+    }
+    report_path = source_bundle.write_report("nvfp4_efficiency_sweep", payload)
+    source_bundle.save()
     return report_path

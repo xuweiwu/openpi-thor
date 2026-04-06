@@ -99,6 +99,8 @@ class _DummyQuantizedLinear(torch.nn.Linear):
     def __init__(self) -> None:
         super().__init__(3, 3)
         self.weight_quantizer = _DummyQuantizer()
+        self.input_quantizer = _DummyQuantizer()
+        self.output_quantizer = _DummyQuantizer()
 
 
 def test_prepare_model_for_export_precision_keeps_stability_modules_float32() -> None:
@@ -140,33 +142,112 @@ def test_patch_model_for_export_sanitizes_nonfinite_gemma_mlp_hidden() -> None:
     assert torch.isfinite(mlp.down_proj.last_input).all()
 
 
-def test_apply_nvfp4_gemma_mlp_weight_only_quant_cfg_only_targets_weight_quantizer() -> None:
+def test_apply_nvfp4_public_quant_cfg_targets_all_attention_linears() -> None:
     quant_cfg = {"quant_cfg": {"existing": {"enable": True}}}
 
-    updated = export._apply_nvfp4_gemma_mlp_weight_only_quant_cfg(quant_cfg)
+    updated = export._apply_nvfp4_quant_cfg(quant_cfg, export._current_public_nvfp4_experiment())
 
     assert updated["quant_cfg"]["existing"] == {"enable": True}
-    assert updated["quant_cfg"][export._NVFP4_GEMMA_MLP_WEIGHT_SELECTOR] == {
+    assert updated["quant_cfg"]["paligemma_with_expert.paligemma.model.language_model.layers.0.self_attn.q_proj"] == {
         "num_bits": (2, 1),
         "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
         "axis": None,
         "enable": True,
     }
+    assert updated["quant_cfg"]["paligemma_with_expert.paligemma.model.language_model.layers.17.self_attn.o_proj"] == {
+        "num_bits": (2, 1),
+        "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+        "axis": None,
+        "enable": True,
+    }
+    assert not any(".mlp." in selector for selector in updated["quant_cfg"])
 
 
-def test_mark_nvfp4_gemma_mlp_weight_quantizers_only_updates_mlp_linears() -> None:
+def test_mark_nvfp4_public_quantizers_only_update_attention_linears() -> None:
     model = torch.nn.Module()
-    model.mlp = torch.nn.Module()
-    model.mlp.down_proj = _DummyQuantizedLinear().to(dtype=torch.float16)
-    model.self_attn = torch.nn.Module()
-    model.self_attn.q_proj = _DummyQuantizedLinear().to(dtype=torch.float16)
+    model.paligemma_with_expert = torch.nn.Module()
+    model.paligemma_with_expert.paligemma = torch.nn.Module()
+    model.paligemma_with_expert.paligemma.model = torch.nn.Module()
+    model.paligemma_with_expert.paligemma.model.language_model = torch.nn.Module()
+    model.paligemma_with_expert.paligemma.model.language_model.layers = torch.nn.ModuleList([torch.nn.Module()])
+    model.paligemma_with_expert.paligemma.model.language_model.layers[0].mlp = torch.nn.Module()
+    model.paligemma_with_expert.paligemma.model.language_model.layers[0].mlp.down_proj = _DummyQuantizedLinear().to(dtype=torch.float16)
+    model.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn = torch.nn.Module()
+    model.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj = _DummyQuantizedLinear().to(dtype=torch.float16)
 
-    export._mark_nvfp4_gemma_mlp_weight_quantizers(model)
+    export._mark_nvfp4_quantizers(model, export._current_public_nvfp4_experiment())
 
-    assert model.mlp.down_proj.weight_quantizer._trt_high_precision_dtype == "Half"
-    assert model.mlp.down_proj.weight_quantizer._onnx_quantizer_type == "static"
-    assert model.self_attn.q_proj.weight_quantizer._trt_high_precision_dtype is None
-    assert model.self_attn.q_proj.weight_quantizer._onnx_quantizer_type is None
+    mlp = model.paligemma_with_expert.paligemma.model.language_model.layers[0].mlp.down_proj
+    attn = model.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj
+    assert mlp.weight_quantizer._trt_high_precision_dtype is None
+    assert mlp.weight_quantizer._onnx_quantizer_type is None
+    assert attn.weight_quantizer._trt_high_precision_dtype == "Half"
+    assert attn.weight_quantizer._onnx_quantizer_type == "static"
+    assert attn.input_quantizer._trt_high_precision_dtype == "Half"
+    assert attn.input_quantizer._onnx_quantizer_type == "dynamic"
+    assert attn.output_quantizer._onnx_quantizer_type == "dynamic"
+
+
+def test_nvfp4_quant_cfg_selectors_support_full_mlp_and_attention_scopes() -> None:
+    experiment = export._NVFP4Experiment(
+        full_mlp_layers=(16,),
+        full_attention_layers=(17,),
+        disable_output_quantizers=True,
+    )
+
+    selectors = export._nvfp4_quant_cfg_selectors(experiment)
+
+    assert "paligemma_with_expert.paligemma.model.language_model.layers.16.mlp.gate_proj" in selectors
+    assert "paligemma_with_expert.paligemma.model.language_model.layers.16.mlp.gate_proj.output_quantizer" in selectors
+    assert "paligemma_with_expert.paligemma.model.language_model.layers.17.self_attn.q_proj" in selectors
+    assert "paligemma_with_expert.paligemma.model.language_model.layers.17.self_attn.q_proj.output_quantizer" in selectors
+
+
+def test_mark_nvfp4_quantizers_marks_full_scope_linears() -> None:
+    model = torch.nn.Module()
+    model.paligemma_with_expert = torch.nn.Module()
+    model.paligemma_with_expert.paligemma = torch.nn.Module()
+    model.paligemma_with_expert.paligemma.model = torch.nn.Module()
+    model.paligemma_with_expert.paligemma.model.language_model = torch.nn.Module()
+    model.paligemma_with_expert.paligemma.model.language_model.layers = torch.nn.ModuleList([torch.nn.Module()])
+    model.paligemma_with_expert.paligemma.model.language_model.layers[0].mlp = torch.nn.Module()
+    model.paligemma_with_expert.paligemma.model.language_model.layers[0].mlp.gate_proj = _DummyQuantizedLinear().to(dtype=torch.float16)
+
+    export._mark_nvfp4_quantizers(
+        model,
+        export._NVFP4Experiment(full_mlp_layers=(0,)),
+    )
+
+    gate_proj = model.paligemma_with_expert.paligemma.model.language_model.layers[0].mlp.gate_proj
+    assert gate_proj.weight_quantizer._trt_high_precision_dtype == "Half"
+    assert gate_proj.weight_quantizer._onnx_quantizer_type == "static"
+    assert gate_proj.input_quantizer._trt_high_precision_dtype == "Half"
+    assert gate_proj.input_quantizer._onnx_quantizer_type == "dynamic"
+    assert gate_proj.output_quantizer._onnx_quantizer_type == "dynamic"
+
+
+def test_resolve_nvfp4_experiment_keeps_current_public_behavior() -> None:
+    resolved = export._resolve_nvfp4_experiment(enable_llm_nvfp4=True, nvfp4_experiment=None)
+
+    assert resolved is not None
+    assert resolved.scope == "full_attention"
+    assert resolved.full_attention_layers == export._PUBLIC_NVFP4_ATTENTION_LAYERS
+    assert resolved.quantize_attention_matmul is True
+
+
+def test_ensure_gemma_fp4_compatibility_uses_patched_source(monkeypatch) -> None:
+    monkeypatch.setattr(export, "_ensure_gemma_fp4_compatibility", export._ensure_gemma_fp4_compatibility)
+
+    from openpi_thor import compat
+
+    monkeypatch.setattr(compat, "_module_sources", lambda: {"transformers.models.gemma.modeling_gemma": Path("/tmp/modeling_gemma.py")})
+    monkeypatch.setattr(
+        compat,
+        "_patched_source",
+        lambda module_name, path: "attn_output = attn_output.reshape(*input_shape, self.config.num_attention_heads * self.head_dim).contiguous()",
+    )
+
+    export._ensure_gemma_fp4_compatibility()
 
 
 def test_postprocess_onnx_model_preserves_sibling_artifacts(tmp_path: Path, monkeypatch) -> None:

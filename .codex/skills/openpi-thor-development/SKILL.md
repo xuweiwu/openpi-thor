@@ -66,6 +66,22 @@ uv pip install --python .venv-thor/bin/python --no-deps \
 - `openpi_on_thor` is tutorial/reference only; runtime code should not depend on it.
 - TensorRT builds can take many minutes; a zero-byte engine file during build is normal.
 
+## FP8 / NVFP4 lessons already learned
+
+- Keep `32` as the default fp8 calibration count unless new evidence says otherwise. The tested
+  Thor stack did not show a plain-fp8 accuracy gain from raising it to `128`.
+- The public `--enable-llm-nvfp4` path is attention-only:
+  - all Gemma attention layers use NVFP4
+  - explicit attention-matmul quantization is enabled
+  - Gemma MLP stays on fp8
+- Do not revert the public path to the earlier Gemma MLP weight-only fallback. That path kept
+  accuracy closer than broad full-layer NVFP4, but it was slower than plain fp8 because TensorRT
+  lowered it into cast/dequant-heavy kernels.
+- Do not promote broad attention+MLP full-layer NVFP4 casually. It regressed badly after
+  ONNX/TensorRT lowering even when quantized PyTorch still looked reasonable.
+- For NVFP4 work, always inspect `trtexec` layer profiles. Good candidates avoid
+  `ReplCastMulCast`-style dominance and preserve fused attention kernels.
+
 ## Debug order for backend quality
 
 If outputs are wrong, use:
@@ -78,6 +94,13 @@ If outputs are wrong, use:
 6. only then FP8/NVFP4
 
 For Gemma-based `pi05_*`, keep strongly typed TensorRT on by default.
+
+For deeper NVFP4 investigation, keep this extra order in mind:
+
+1. compare candidate TensorRT against plain fp8 TensorRT
+2. compare the same candidate against JAX on the same fixed real-data examples
+3. inspect `trtexec` profiles before trusting a speedup claim
+4. only then decide whether a scoped NVFP4 candidate is worth promoting
 
 ## Useful commands
 

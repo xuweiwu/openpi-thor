@@ -78,14 +78,19 @@ class ExportOnnxCommand:
         bool,
         tyro.conf.arg(
             help=(
-                "Enable the current openpi-thor NVFP4 path: Gemma MLP weights use NVFP4 while the rest of the "
-                "language-model activations stay on FP8."
+                "Enable the current openpi-thor NVFP4 path: all Gemma attention layers use NVFP4 and explicit "
+                "attention-matmul quantization, while the Gemma MLP path stays on FP8."
             )
         ),
     ] = False
     quantize_attention_matmul: Annotated[
         bool,
-        tyro.conf.arg(help="Insert quantized attention matmul nodes so fp8/NVFP4 attention ops are explicit in ONNX."),
+        tyro.conf.arg(
+            help=(
+                "Insert quantized attention matmul nodes so fp8/NVFP4 attention ops are explicit in ONNX. "
+                "Automatically enabled by --enable-llm-nvfp4."
+            )
+        ),
     ] = False
     num_calibration_samples: Annotated[
         int,
@@ -262,14 +267,19 @@ class PrepareEngineCommand:
         bool,
         tyro.conf.arg(
             help=(
-                "Enable the current openpi-thor NVFP4 path: Gemma MLP weights use NVFP4 while the rest of the "
-                "language-model activations stay on FP8."
+                "Enable the current openpi-thor NVFP4 path: all Gemma attention layers use NVFP4 and explicit "
+                "attention-matmul quantization, while the Gemma MLP path stays on FP8."
             )
         ),
     ] = False
     quantize_attention_matmul: Annotated[
         bool,
-        tyro.conf.arg(help="Insert quantized attention matmul nodes before exporting fp8 or NVFP4 graphs."),
+        tyro.conf.arg(
+            help=(
+                "Insert quantized attention matmul nodes before exporting fp8 or NVFP4 graphs. "
+                "Automatically enabled by --enable-llm-nvfp4."
+            )
+        ),
     ] = False
     num_calibration_samples: Annotated[
         int,

@@ -343,10 +343,11 @@ openpi-thor prepare-engine \
 `128` did not improve accuracy, so `openpi-thor` keeps `32` as the fast default. Use `128` or
 `256` only when you explicitly want a slower comparison sweep.
 
-`--enable-llm-nvfp4` in `openpi-thor` currently means a narrower path than the original tutorial:
-Gemma MLP weights use NVFP4 while the rest of the language-model activations stay on fp8. On the
-tested Jetson AGX Thor stack, this narrower path stayed in the same error regime as pure fp8,
-while broader full-layer NVFP4 drifted badly after TensorRT lowering.
+`--enable-llm-nvfp4` in `openpi-thor` currently enables broad Gemma attention-side NVFP4:
+all Gemma attention layers use NVFP4, and quantized attention matmuls are turned on
+automatically, while the Gemma MLP path stays on fp8. On the tested Jetson AGX Thor stack, this
+attention-only NVFP4 path outperformed plain fp8 without exceeding the fp8-vs-JAX error budget,
+while broader attention+MLP NVFP4 still drifted too much after TensorRT lowering.
 
 Optional dataset overrides for calibration and validation:
 
@@ -413,21 +414,31 @@ That combination was the difference between the broken and usable fp16 paths on 
 In our real-sample validations, the corrected fp16 TensorRT engine matched JAX closely and became
 the recommended deployment path.
 
-### NVFP4: broad full-layer NVFP4 regressed badly after TensorRT lowering
+### NVFP4: broad full-layer attention+MLP NVFP4 regressed badly after TensorRT lowering
 
-The original broad NVFP4 path was much worse. Quantized PyTorch stayed reasonably close to the fp8
-baseline, but the TensorRT engine drifted badly after ONNX/TensorRT lowering. In our use case, the
-broad full-layer `fp8+nvfp4` path showed roughly a `30x` larger mean absolute error than pure fp8.
+The original broad NVFP4 path that pushed both Gemma attention and Gemma MLP too far was much
+worse. Quantized PyTorch stayed reasonably close to the fp8 baseline, but the TensorRT engine
+drifted badly after ONNX/TensorRT lowering. In our use case, that broad attention+MLP
+`fp8+nvfp4` path showed roughly a `30x` larger mean absolute error than pure fp8.
 
-That is why `openpi-thor` does not keep the broad full-layer NVFP4 recipe. The current
-`--enable-llm-nvfp4` path is intentionally narrower:
+That is why `openpi-thor` does not keep the broad full-layer-everywhere NVFP4 recipe. The current
+`--enable-llm-nvfp4` path is:
 
-- Gemma MLP weights use NVFP4
-- language-model activations stay on fp8
+- all Gemma attention layers use NVFP4
+- attention matmuls are quantized explicitly
+- the Gemma MLP path stays on fp8
 
-That narrower path brought the TensorRT result back into the same accuracy regime as pure fp8 on
-the tested Jetson AGX Thor stack when compared against both JAX and the reference fp16 TensorRT
-engine.
+That attention-only path brought the TensorRT result back into the same accuracy regime as pure
+fp8 on the tested Jetson AGX Thor stack, while also improving steady-state engine compute time.
+
+If you debug this area further, the most reliable workflow is:
+
+1. keep LayerNorm/RMSNorm and other stability-sensitive paths on the existing higher-precision
+   export path
+2. profile candidate engines with `trtexec` instead of relying on end-to-end Python timing
+3. reject candidates whose TensorRT layer profiles are dominated by cast/dequant helper kernels
+4. compare every candidate against both plain fp8 TensorRT and the JAX reference on the same
+   real-data examples
 
 </details>
 
@@ -574,9 +585,10 @@ Important notes:
 - The tutorial's warning about pure fp16 export applies to its own exporter. `openpi-thor`
   supports a custom fp16 path that preserves fp32 stability islands and uses strongly typed
   TensorRT builds.
-- `openpi-thor` also narrows NVFP4 to Gemma MLP weights instead of enabling broad full-layer
-  NVFP4. That is an intentional deviation from the tutorial because it produced much better
-  TensorRT accuracy on the tested Jetson AGX Thor stack.
+- `openpi-thor` keeps the public NVFP4 path narrower than “full-layer everywhere”: it enables
+  NVFP4 across Gemma attention with explicit attention-matmul quantization, while leaving the
+  Gemma MLP path on fp8. That is an intentional deviation from the broadest tutorial recipe
+  because it produced a better speed/accuracy tradeoff on the tested Jetson AGX Thor stack.
 - FP8 calibration defaults to `32` real samples. Use `128` or `256` only for slower calibration
   sweeps and comparison experiments.
 

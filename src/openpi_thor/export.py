@@ -30,6 +30,67 @@ from openpi_thor.runtime import load_pytorch_bundle
 logger = logging.getLogger(__name__)
 
 
+_GEMMA_LM_LAYER_PREFIX = "paligemma_with_expert.paligemma.model.language_model.layers"
+_GEMMA_MLP_LINEAR_NAMES = ("gate_proj", "up_proj", "down_proj")
+_GEMMA_ATTENTION_LINEAR_NAMES = ("q_proj", "k_proj", "v_proj", "o_proj")
+_PUBLIC_NVFP4_ATTENTION_LAYERS = tuple(range(_gemma.get_config("gemma_300m").depth))
+
+
+@dataclasses.dataclass(frozen=True)
+class _NVFP4Experiment:
+    """Internal-only NVFP4 scope selection for export/debug investigations."""
+
+    full_mlp_layers: tuple[int, ...] = ()
+    full_attention_layers: tuple[int, ...] = ()
+    quantize_attention_matmul: bool = False
+    disable_output_quantizers: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "full_mlp_layers", tuple(sorted(dict.fromkeys(self.full_mlp_layers))))
+        object.__setattr__(self, "full_attention_layers", tuple(sorted(dict.fromkeys(self.full_attention_layers))))
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.full_mlp_layers) or bool(self.full_attention_layers)
+
+    @property
+    def scope(self) -> str:
+        has_full_mlp = bool(self.full_mlp_layers)
+        has_full_attention = bool(self.full_attention_layers)
+        if has_full_mlp and has_full_attention:
+            return "full_mlp_and_attention"
+        if has_full_mlp and not has_full_attention:
+            return "full_mlp"
+        if has_full_attention and not has_full_mlp:
+            return "full_attention"
+        return "disabled"
+
+    def label(self) -> str:
+        parts = [self.scope]
+        if self.full_mlp_layers:
+            parts.append(f"mlp_l{'_'.join(str(layer) for layer in self.full_mlp_layers)}")
+        if self.full_attention_layers:
+            if self.full_attention_layers == _PUBLIC_NVFP4_ATTENTION_LAYERS:
+                parts.append("attn_all")
+            else:
+                parts.append(f"attn_l{'_'.join(str(layer) for layer in self.full_attention_layers)}")
+        if self.quantize_attention_matmul:
+            parts.append("matmul_qdq")
+        if self.disable_output_quantizers:
+            parts.append("no_out_q")
+        return "__".join(parts)
+
+    def manifest_extra(self) -> dict[str, object]:
+        return {
+            "nvfp4_scope": self.scope,
+            "nvfp4_label": self.label(),
+            "nvfp4_full_mlp_layers": list(self.full_mlp_layers),
+            "nvfp4_full_attention_layers": list(self.full_attention_layers),
+            "nvfp4_disable_output_quantizers": self.disable_output_quantizers,
+            "nvfp4_quantize_attention_matmul": self.quantize_attention_matmul,
+        }
+
+
 def _resolve_train_config(config: str | _config.TrainConfig) -> _config.TrainConfig:
     if isinstance(config, _config.TrainConfig):
         return config
@@ -321,10 +382,6 @@ _FLOAT32_EXPORT_BUFFER_SELECTORS = (
     "rotary_emb.original_inv_freq",
 )
 
-_NVFP4_GEMMA_MLP_WEIGHT_SELECTOR = (
-    "paligemma_with_expert.paligemma.model.language_model.layers.*.mlp.*.weight_quantizer"
-)
-
 
 def _module_and_attr(root: torch.nn.Module, dotted_name: str) -> tuple[torch.nn.Module, str]:
     parts = dotted_name.split(".")
@@ -336,6 +393,106 @@ def _module_and_attr(root: torch.nn.Module, dotted_name: str) -> tuple[torch.nn.
 
 def _keep_export_float32(name: str, selectors: tuple[str, ...]) -> bool:
     return any(selector in name for selector in selectors)
+
+
+def _current_public_nvfp4_experiment() -> _NVFP4Experiment:
+    return _NVFP4Experiment(
+        full_attention_layers=_PUBLIC_NVFP4_ATTENTION_LAYERS,
+        quantize_attention_matmul=True,
+    )
+
+
+def _resolve_nvfp4_experiment(
+    *,
+    enable_llm_nvfp4: bool,
+    nvfp4_experiment: _NVFP4Experiment | None,
+) -> _NVFP4Experiment | None:
+    if nvfp4_experiment is not None:
+        return nvfp4_experiment if nvfp4_experiment.enabled else None
+    if enable_llm_nvfp4:
+        return _current_public_nvfp4_experiment()
+    return None
+
+
+def _selector_layers(layers: tuple[int, ...] | None) -> tuple[str, ...]:
+    if layers is None:
+        return ("*",)
+    return tuple(str(layer) for layer in layers)
+
+
+def _nvfp4_block_quant_cfg() -> dict[str, object]:
+    return {
+        "num_bits": (2, 1),
+        "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+        "axis": None,
+        "enable": True,
+    }
+
+
+def _nvfp4_disabled_output_quantizer_cfg() -> dict[str, object]:
+    config = _nvfp4_block_quant_cfg()
+    config["enable"] = False
+    return config
+
+
+def _nvfp4_quant_cfg_selectors(experiment: _NVFP4Experiment) -> dict[str, dict[str, object]]:
+    selectors: dict[str, dict[str, object]] = {}
+    base_config = _nvfp4_block_quant_cfg()
+
+    for layer_token in _selector_layers(experiment.full_mlp_layers):
+        for linear_name in _GEMMA_MLP_LINEAR_NAMES:
+            selectors[f"{_GEMMA_LM_LAYER_PREFIX}.{layer_token}.mlp.{linear_name}"] = dict(base_config)
+            if experiment.disable_output_quantizers:
+                selectors[
+                    f"{_GEMMA_LM_LAYER_PREFIX}.{layer_token}.mlp.{linear_name}.output_quantizer"
+                ] = _nvfp4_disabled_output_quantizer_cfg()
+
+    for layer_token in _selector_layers(experiment.full_attention_layers):
+        for linear_name in _GEMMA_ATTENTION_LINEAR_NAMES:
+            selectors[f"{_GEMMA_LM_LAYER_PREFIX}.{layer_token}.self_attn.{linear_name}"] = dict(base_config)
+            if experiment.disable_output_quantizers:
+                selectors[
+                    f"{_GEMMA_LM_LAYER_PREFIX}.{layer_token}.self_attn.{linear_name}.output_quantizer"
+                ] = _nvfp4_disabled_output_quantizer_cfg()
+
+    return selectors
+
+
+_GEMMA_LANGUAGE_LINEAR_RE = re.compile(
+    r"^paligemma_with_expert\.paligemma\.model\.language_model\.layers\.(?P<layer>\d+)\.(?P<suffix>.+)$"
+)
+
+
+def _matches_nvfp4_linear_scope(module_name: str, experiment: _NVFP4Experiment) -> tuple[bool, bool]:
+    """Return `(matches, full_scope)` for a quantized linear module name."""
+
+    match = _GEMMA_LANGUAGE_LINEAR_RE.match(module_name)
+    if match is None:
+        return False, False
+    layer = int(match.group("layer"))
+    suffix = match.group("suffix")
+
+    if suffix in {f"mlp.{name}" for name in _GEMMA_MLP_LINEAR_NAMES}:
+        if layer in experiment.full_mlp_layers:
+            return True, True
+    if suffix in {f"self_attn.{name}" for name in _GEMMA_ATTENTION_LINEAR_NAMES} and layer in experiment.full_attention_layers:
+        return True, True
+    return False, False
+
+
+def _ensure_gemma_fp4_compatibility() -> None:
+    """Check that the prepared Gemma source includes the FP4-safe reshape patch."""
+
+    from openpi_thor import compat as _compat
+
+    patched_source = _compat._patched_source(  # noqa: SLF001
+        "transformers.models.gemma.modeling_gemma",
+        _compat._module_sources()["transformers.models.gemma.modeling_gemma"],  # noqa: SLF001
+    )
+    if "attn_output.reshape(*input_shape, self.config.num_attention_heads * self.head_dim)" not in patched_source:
+        raise RuntimeError(
+            "GemmaAttention.forward is missing the explicit FP4-safe reshape required for NVFP4 export."
+        )
 
 
 def prepare_model_for_export_precision(
@@ -381,37 +538,37 @@ def _sanitize_nonfinite_like(tensor: torch.Tensor) -> torch.Tensor:
     return torch.nan_to_num(tensor, nan=0.0, posinf=finfo.max, neginf=finfo.min)
 
 
-def _apply_nvfp4_gemma_mlp_weight_only_quant_cfg(quant_cfg: dict) -> dict:
-    """Restrict NVFP4 to Gemma MLP weights while keeping activations on FP8.
+def _apply_nvfp4_quant_cfg(quant_cfg: dict, experiment: _NVFP4Experiment) -> dict:
+    """Apply one internal NVFP4 scope selection to the ModelOpt quant config."""
 
-    Full-layer NVFP4 on the tested Jetson AGX Thor stack caused severe TensorRT
-    drift even when the quantized PyTorch model stayed close to the FP8 baseline.
-    Narrowing NVFP4 to Gemma MLP weights preserves most of the fp8 accuracy
-    while still exercising the NVFP4 export/runtime path.
-    """
-
-    quant_cfg["quant_cfg"][_NVFP4_GEMMA_MLP_WEIGHT_SELECTOR] = {
-        "num_bits": (2, 1),
-        "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
-        "axis": None,
-        "enable": True,
-    }
+    for selector, selector_cfg in _nvfp4_quant_cfg_selectors(experiment).items():
+        quant_cfg["quant_cfg"][selector] = dict(selector_cfg)
     return quant_cfg
 
 
-def _mark_nvfp4_gemma_mlp_weight_quantizers(model: torch.nn.Module) -> None:
-    """Stamp ONNX export hints for the Gemma MLP weights using NVFP4."""
+def _mark_nvfp4_quantizers(model: torch.nn.Module, experiment: _NVFP4Experiment) -> None:
+    """Stamp ONNX export hints for the quantized modules selected by one experiment."""
 
     for module_name, module in model.named_modules():
         if not isinstance(module, torch.nn.Linear):
             continue
-        if ".mlp." not in module_name and not module_name.startswith("mlp."):
+        matches, full_scope = _matches_nvfp4_linear_scope(module_name, experiment)
+        if not matches:
             continue
+        high_precision_dtype = _trt_high_precision_dtype_for_tensor_dtype(module.weight.dtype)
         weight_quantizer = getattr(module, "weight_quantizer", None)
-        if weight_quantizer is None:
+        if weight_quantizer is not None:
+            weight_quantizer._trt_high_precision_dtype = high_precision_dtype  # noqa: SLF001
+            weight_quantizer._onnx_quantizer_type = "static"  # noqa: SLF001
+        if not full_scope:
             continue
-        weight_quantizer._trt_high_precision_dtype = _trt_high_precision_dtype_for_tensor_dtype(module.weight.dtype)  # noqa: SLF001
-        weight_quantizer._onnx_quantizer_type = "static"  # noqa: SLF001
+        input_quantizer = getattr(module, "input_quantizer", None)
+        output_quantizer = getattr(module, "output_quantizer", None)
+        if input_quantizer is not None:
+            input_quantizer._trt_high_precision_dtype = high_precision_dtype  # noqa: SLF001
+            input_quantizer._onnx_quantizer_type = "dynamic"  # noqa: SLF001
+        if output_quantizer is not None:
+            output_quantizer._onnx_quantizer_type = "dynamic"  # noqa: SLF001
 
 
 def _patch_gemma_mlp_for_export(model: torch.nn.Module) -> None:
@@ -562,23 +719,34 @@ def quantize_model(
     num_steps: int,
     enable_llm_nvfp4: bool,
     quantize_attention_matmul: bool,
+    nvfp4_experiment: _NVFP4Experiment | None = None,
 ) -> torch.nn.Module:
     """Apply ModelOpt quantization to a patched PyTorch policy model."""
 
-    if enable_llm_nvfp4:
+    resolved_nvfp4_experiment = _resolve_nvfp4_experiment(
+        enable_llm_nvfp4=enable_llm_nvfp4,
+        nvfp4_experiment=nvfp4_experiment,
+    )
+    effective_quantize_attention_matmul = quantize_attention_matmul or bool(
+        resolved_nvfp4_experiment and resolved_nvfp4_experiment.quantize_attention_matmul
+    )
+
+    if resolved_nvfp4_experiment is not None:
         _prefer_system_blackwell_ptxas()
+        if resolved_nvfp4_experiment.full_mlp_layers or resolved_nvfp4_experiment.full_attention_layers:
+            _ensure_gemma_fp4_compatibility()
     import modelopt.torch.quantization as mtq
 
-    if quantize_attention_matmul:
+    if effective_quantize_attention_matmul:
         replace_attention_with_quantized_version()
 
     quant_cfg = mtq.FP8_DEFAULT_CFG
     quant_cfg["quant_cfg"]["nn.Conv2d"] = {"*": {"enable": False}}
 
-    if enable_llm_nvfp4:
-        quant_cfg = _apply_nvfp4_gemma_mlp_weight_only_quant_cfg(quant_cfg)
-        logger.info("Applying the openpi-thor NVFP4 path: Gemma MLP weights use NVFP4 and activations stay on FP8")
-    elif quantize_attention_matmul:
+    if resolved_nvfp4_experiment is not None:
+        quant_cfg = _apply_nvfp4_quant_cfg(quant_cfg, resolved_nvfp4_experiment)
+        logger.info("Applying NVFP4 experiment: %s", resolved_nvfp4_experiment.label())
+    elif effective_quantize_attention_matmul:
         logger.info("Applying FP8 quantization with explicit attention matmul quantizers")
     else:
         logger.info("Applying plain FP8 quantization")
@@ -591,8 +759,8 @@ def quantize_model(
                 mdl.sample_actions(device, observation, noise=noise, num_steps=num_steps)
 
     quantized_model = mtq.quantize(model, quant_cfg, forward_loop=forward_loop)
-    if enable_llm_nvfp4:
-        _mark_nvfp4_gemma_mlp_weight_quantizers(quantized_model)
+    if resolved_nvfp4_experiment is not None:
+        _mark_nvfp4_quantizers(quantized_model, resolved_nvfp4_experiment)
     return quantized_model
 
 
@@ -606,8 +774,11 @@ def _trt_high_precision_dtype_for_tensor_dtype(dtype: torch.dtype) -> str:
     return "Float"
 
 
-def _artifact_key(options: ExportOptions) -> str:
-    if options.precision.lower() == "fp8" and options.enable_llm_nvfp4:
+def _artifact_key(options: ExportOptions, *, nvfp4_experiment: _NVFP4Experiment | None = None) -> str:
+    if options.precision.lower() == "fp8" and _resolve_nvfp4_experiment(
+        enable_llm_nvfp4=options.enable_llm_nvfp4,
+        nvfp4_experiment=nvfp4_experiment,
+    ):
         return "fp8_nvfp4"
     return options.precision.lower()
 
@@ -639,17 +810,23 @@ def export_to_onnx_bundle(
     pytorch_device: str | None = None,
     dataset_repo_id: str | None = None,
     dataset_root: str | Path | None = None,
+    nvfp4_experiment: _NVFP4Experiment | None = None,
 ) -> ArtifactBundle:
     """Export a bundle to ONNX and record the resulting artifact metadata."""
 
     prepare_runtime()
     train_config = _resolve_train_config(config)
     bundle = _resolve_bundle(bundle_dir, config_name=train_config.name)
+    resolved_nvfp4_experiment = _resolve_nvfp4_experiment(
+        enable_llm_nvfp4=options.enable_llm_nvfp4,
+        nvfp4_experiment=nvfp4_experiment,
+    )
+    key = _artifact_key(options, nvfp4_experiment=resolved_nvfp4_experiment)
     logger.info(
         "Exporting ONNX: config=%s bundle=%s precision=%s steps=%s",
         train_config.name,
         bundle.bundle_dir,
-        _artifact_key(options),
+        key,
         options.num_steps,
     )
     policy, _ = load_pytorch_bundle(
@@ -693,6 +870,7 @@ def export_to_onnx_bundle(
             num_steps=options.num_steps,
             enable_llm_nvfp4=options.enable_llm_nvfp4,
             quantize_attention_matmul=options.quantize_attention_matmul,
+            nvfp4_experiment=resolved_nvfp4_experiment,
         )
         calibration_source_name = calibration_source.name
         calibration_num_samples = len(calibration_batches)
@@ -713,7 +891,6 @@ def export_to_onnx_bundle(
     onnx_dir = bundle.bundle_dir / "onnx"
     onnx_dir.mkdir(parents=True, exist_ok=True)
 
-    key = _artifact_key(options)
     onnx_path = onnx_dir / f"model_{key}.onnx"
     logger.info("Exporting ONNX graph to %s", onnx_path)
     with torch.no_grad():
@@ -736,8 +913,8 @@ def export_to_onnx_bundle(
                 "actions": {0: "batch_size"},
             },
         )
-    postprocess_onnx_model(onnx_path, enable_llm_nvfp4=options.enable_llm_nvfp4)
-    checker_warning = _validate_exported_onnx(onnx_path, enable_llm_nvfp4=options.enable_llm_nvfp4)
+    postprocess_onnx_model(onnx_path, enable_llm_nvfp4=resolved_nvfp4_experiment is not None)
+    checker_warning = _validate_exported_onnx(onnx_path, enable_llm_nvfp4=resolved_nvfp4_experiment is not None)
     if checker_warning is not None:
         logger.info("Accepted TensorRT-specific ONNX checker warning for %s", onnx_path.name)
 
@@ -752,8 +929,8 @@ def export_to_onnx_bundle(
         calibration_num_samples=calibration_num_samples,
         export_options=dataclasses.asdict(options),
     )
-    if options.enable_llm_nvfp4:
-        bundle.ensure_artifact(key, precision=key).extra["nvfp4_scope"] = "gemma_mlp_weight_only"
+    if resolved_nvfp4_experiment is not None:
+        bundle.ensure_artifact(key, precision=key).extra.update(resolved_nvfp4_experiment.manifest_extra())
     bundle.write_report(
         f"export_{key}",
         {
@@ -764,13 +941,18 @@ def export_to_onnx_bundle(
             "onnx_path": str(onnx_path),
             "precision": key,
             "num_steps": options.num_steps,
-            "enable_llm_nvfp4": options.enable_llm_nvfp4,
-            "quantize_attention_matmul": options.quantize_attention_matmul,
+            "enable_llm_nvfp4": resolved_nvfp4_experiment is not None,
+            "quantize_attention_matmul": (
+                options.quantize_attention_matmul
+                or bool(resolved_nvfp4_experiment and resolved_nvfp4_experiment.quantize_attention_matmul)
+            ),
             "calibration_source": calibration_source_name,
             "calibration_num_samples": calibration_num_samples,
             "dataset_repo_id": dataset_repo_id,
             "dataset_root": str(dataset_root) if dataset_root is not None else None,
-            "nvfp4_scope": "gemma_mlp_weight_only" if options.enable_llm_nvfp4 else None,
+            "nvfp4_experiment": (
+                resolved_nvfp4_experiment.manifest_extra() if resolved_nvfp4_experiment is not None else None
+            ),
             "onnx_checker_warning": checker_warning,
             "export_options": dataclasses.asdict(options),
         },

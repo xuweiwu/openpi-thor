@@ -70,6 +70,39 @@ Default behavior should remain:
 - strongly typed TensorRT builds on by default
 - weakly typed builds only as an explicit debugging opt-out
 
+### Current public NVFP4 policy is attention-only
+
+The public `--enable-llm-nvfp4` path is no longer the old Gemma MLP weight-only fallback.
+After the internal fp8/NVFP4 investigation, the current shipped behavior is:
+
+- NVFP4 across all Gemma attention layers
+- explicit attention-matmul quantization on
+- Gemma MLP kept on fp8
+
+Do not casually reintroduce either of these older public-path ideas:
+
+- broad attention+MLP full-layer NVFP4
+- Gemma MLP weight-only NVFP4
+
+The first one regressed badly after TensorRT lowering. The second one stayed closer in accuracy
+but was slower than plain fp8 because TensorRT lowered it into cast/dequant-heavy kernels.
+
+### TensorRT profiles matter for NVFP4 decisions
+
+For fp8/NVFP4 work, backend quality is not just about validation metrics. TensorRT layer profiles
+were the key signal in the NVFP4 investigation:
+
+- good candidates avoided `ReplCastMulCast`-style dominance
+- good candidates preserved fused attention kernels on the hot path
+- bad candidates could look reasonable in quantized PyTorch and still regress only after
+  ONNX/TensorRT lowering
+
+If you change the NVFP4 path, check all three:
+
+- JAX-referenced validation
+- fp8-engine comparison
+- `trtexec` layer profiles
+
 ### `state` being unused in `pi05` TensorRT graphs is expected
 
 For `pi05` models, `state` may appear unused or only shape-used in the ONNX graph. This is
@@ -188,6 +221,11 @@ These are real problems found by rebuilding from a clean companion checkout:
 - Strongly typed TensorRT engine builds can take many minutes. During build, the target engine
   file may remain size `0` until `trtexec` finishes writing it.
 - Use `openpi-thor status --verbose` to inspect phase reports after long-running commands.
+- For fp8/NVFP4, do not assume more calibration samples help. On the tested stack, plain fp8
+  did not improve when calibration increased from `32` to `128`, so `32` remains the default.
+- The internal NVFP4 sweep in `debug_nvfp4.py` exists for a reason. Keep it internal, but do not
+  rip it out unless the public path becomes simple enough that the extra profiling/debug harness is
+  no longer needed.
 
 ## Preferred validation order
 
