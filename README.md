@@ -283,6 +283,33 @@ all arguments for one command.
 - `openpi-thor serve`
   Starts the websocket inference server for the selected or recommended engine.
 
+### Bundle manifest and detailed reports
+
+`openpi_thor_bundle.json` is intentionally a compact overview, not a full history log.
+
+Use it to answer high-level questions such as:
+
+- which artifacts exist
+- which engine is recommended
+- whether recent validations passed
+- which detailed report file belongs to each phase
+
+Detailed phase outputs stay under `reports/`, including export, build, validation, and debug
+payloads. Bundle-internal paths recorded in the manifest are bundle-relative, so the bundle
+remains easier to inspect and move as one directory.
+
+For a quick overview, use:
+
+```bash
+openpi-thor status --bundle-dir /path/to/bundle
+```
+
+For the same overview plus loaded report payloads, use:
+
+```bash
+openpi-thor status --bundle-dir /path/to/bundle --verbose
+```
+
 ### Build FP16 first
 
 Start with FP16 before spending time on FP8 or NVFP4:
