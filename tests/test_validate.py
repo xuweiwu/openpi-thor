@@ -80,4 +80,4 @@ def test_compare_tensorrt_engines_does_not_overwrite_recommended_engine(tmp_path
     assert report.reference_path == "/tmp/model_fp16.engine"
     assert report.reference_precision == "fp16"
     assert bundle.get_recommended_engine_path().as_posix() == "/tmp/model_fp16.engine"
-    assert "tensorrt:model_fp16:vs:model_fp8" in bundle.validation_reports
+    assert "tensorrt:model_fp16:vs:model_fp8" in bundle.artifacts["fp8"].validation_reports

@@ -74,6 +74,17 @@ class CheckpointLoadReport:
             "clean": self.clean,
         }
 
+    def to_summary_dict(self) -> dict[str, Any]:
+        return {
+            "total_checkpoint_keys": self.total_checkpoint_keys,
+            "loaded_keys": self.loaded_keys,
+            "unexpected_key_count": len(self.unexpected_keys),
+            "missing_key_count": len(self.missing_keys),
+            "shape_mismatch_count": len(self.shape_mismatches),
+            "fail_closed": self.fail_closed,
+            "clean": self.clean,
+        }
+
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "CheckpointLoadReport":
         return cls(
@@ -172,6 +183,19 @@ class ValidationReport:
             "thresholds": dict(self.thresholds),
         }
 
+    def to_summary_dict(self, *, bundle_dir: Path, report_path: str | None = None) -> dict[str, Any]:
+        return {
+            "reference_backend": self.reference_backend,
+            "reference_path": _bundle_path_ref(bundle_dir, self.reference_path),
+            "reference_precision": self.reference_precision,
+            "passed": self.passed,
+            "num_examples": self.num_examples,
+            "mean_cosine": self.mean_cosine,
+            "mean_abs_error": self.mean_abs_error,
+            "max_abs_error": self.max_abs_error,
+            "report_path": _bundle_path_ref(bundle_dir, report_path),
+        }
+
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ValidationReport":
         return cls(
@@ -233,24 +257,70 @@ class ArtifactRecord:
     export_options: dict[str, Any] = dataclasses.field(default_factory=dict)
     extra: dict[str, Any] = dataclasses.field(default_factory=dict)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, bundle_dir: Path) -> dict[str, Any]:
+        validations = {}
+        for key, report in self.validation_reports.items():
+            validations[key] = report.to_summary_dict(
+                bundle_dir=bundle_dir,
+                report_path=self.report_paths.get(f"validate:{key}"),
+            )
         return {
             "key": self.key,
             "precision": self.precision,
-            "num_steps": self.num_steps,
-            "calibration_source": self.calibration_source,
-            "calibration_num_samples": self.calibration_num_samples,
-            "onnx_path": self.onnx_path,
-            "engine_paths": dict(self.engine_paths),
-            "validation_reports": {k: v.to_manifest_dict() for k, v in self.validation_reports.items()},
-            "report_paths": dict(self.report_paths),
-            "recommended_engine_path": self.recommended_engine_path,
-            "export_options": dict(self.export_options),
-            "extra": dict(self.extra),
+            "export": {
+                "num_steps": self.num_steps,
+                "calibration_source": self.calibration_source,
+                "calibration_num_samples": self.calibration_num_samples,
+                "export_options": dict(self.export_options),
+                "extra": dict(self.extra),
+            },
+            "files": {
+                "onnx": _bundle_path_ref(bundle_dir, self.onnx_path),
+                "engines": {k: _bundle_path_ref(bundle_dir, v) for k, v in self.engine_paths.items()},
+                "recommended_engine": _bundle_path_ref(bundle_dir, self.recommended_engine_path),
+            },
+            "validations": validations,
+            "reports": {k: _bundle_path_ref(bundle_dir, v) for k, v in self.report_paths.items()},
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ArtifactRecord":
+        if any(key in data for key in ("export", "files", "validations", "reports")):
+            export = dict(data.get("export", {}))
+            files = dict(data.get("files", {}))
+            validations: dict[str, ValidationReport] = {}
+            precision = str(data["precision"])
+            for key, summary in data.get("validations", {}).items():
+                summary = dict(summary)
+                validations[str(key)] = ValidationReport(
+                    reference_backend=str(summary["reference_backend"]),
+                    candidate_backend="tensorrt",
+                    config_name="",
+                    reference_path=str(summary["reference_path"]) if summary.get("reference_path") else None,
+                    reference_precision=str(summary["reference_precision"]) if summary.get("reference_precision") else None,
+                    precision=precision,
+                    num_examples=int(summary.get("num_examples", 0)),
+                    passed=bool(summary.get("passed", False)),
+                    mean_cosine=float(summary.get("mean_cosine", 0.0)),
+                    mean_abs_error=float(summary.get("mean_abs_error", 0.0)),
+                    max_abs_error=float(summary.get("max_abs_error", 0.0)),
+                )
+            return cls(
+                key=str(data["key"]),
+                precision=precision,
+                num_steps=int(export["num_steps"]) if export.get("num_steps") is not None else None,
+                calibration_source=str(export["calibration_source"]) if export.get("calibration_source") else None,
+                calibration_num_samples=(
+                    int(export["calibration_num_samples"]) if export.get("calibration_num_samples") is not None else None
+                ),
+                onnx_path=str(files["onnx"]) if files.get("onnx") else None,
+                engine_paths={str(k): str(v) for k, v in files.get("engines", {}).items()},
+                validation_reports=validations,
+                report_paths={str(k): str(v) for k, v in data.get("reports", {}).items()},
+                recommended_engine_path=str(files["recommended_engine"]) if files.get("recommended_engine") else None,
+                export_options=dict(export.get("export_options", {})),
+                extra=dict(export.get("extra", {})),
+            )
         return cls(
             key=str(data["key"]),
             precision=str(data["precision"]),
@@ -291,6 +361,7 @@ class ArtifactBundle:
     report_paths: dict[str, str] = dataclasses.field(default_factory=dict)
     artifacts: dict[str, ArtifactRecord] = dataclasses.field(default_factory=dict)
     recommended_engine: str | None = None
+    recommended_artifact: str | None = None
     extra: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     @property
@@ -333,9 +404,10 @@ class ArtifactBundle:
     ) -> None:
         """Record the ONNX path and export metadata for an artifact variant."""
 
-        self.onnx_paths[key] = str(path)
+        resolved_path = str(path.expanduser().resolve())
+        self.onnx_paths[key] = resolved_path
         artifact = self.ensure_artifact(key, precision=precision or key)
-        artifact.onnx_path = str(path)
+        artifact.onnx_path = resolved_path
         if num_steps is not None:
             artifact.num_steps = num_steps
         if calibration_source is not None:
@@ -355,14 +427,16 @@ class ArtifactBundle:
     ) -> None:
         """Record a built TensorRT engine and optionally mark it as recommended."""
 
-        self.engine_paths[key] = str(path)
+        resolved_path = str(path.expanduser().resolve())
+        self.engine_paths[key] = resolved_path
         if artifact_key is not None:
             artifact = self.ensure_artifact(artifact_key, precision=artifact_key)
-            artifact.engine_paths[key] = str(path)
+            artifact.engine_paths[key] = resolved_path
             if recommended:
-                artifact.recommended_engine_path = str(path)
+                artifact.recommended_engine_path = resolved_path
         if recommended:
-            self.recommended_engine = str(path)
+            self.recommended_engine = resolved_path
+            self.recommended_artifact = artifact_key
 
     def set_validation_report(
         self,
@@ -373,7 +447,6 @@ class ArtifactBundle:
     ) -> None:
         """Attach a validation report to the bundle and, optionally, one artifact variant."""
 
-        self.validation_reports[key] = report
         if report.candidate_backend == "tensorrt" and report.candidate_path:
             engine_key = Path(report.candidate_path).stem
             self.engine_paths[engine_key] = report.candidate_path
@@ -382,14 +455,17 @@ class ArtifactBundle:
             artifact.validation_reports[key] = report
             if report.candidate_backend == "tensorrt" and report.candidate_path:
                 artifact.engine_paths[Path(report.candidate_path).stem] = report.candidate_path
+        else:
+            self.validation_reports[key] = report
 
     def set_recommended_engine(self, path: str | Path | None, *, artifact_key: str | None = None) -> None:
         """Mark one engine as the default serving target for this bundle."""
 
-        self.recommended_engine = str(path) if path is not None else None
+        self.recommended_engine = str(Path(path).expanduser().resolve()) if path is not None else None
+        self.recommended_artifact = artifact_key
         if artifact_key is not None:
             artifact = self.ensure_artifact(artifact_key, precision=artifact_key)
-            artifact.recommended_engine_path = str(path) if path is not None else None
+            artifact.recommended_engine_path = self.recommended_engine
 
     def write_report(
         self,
@@ -406,10 +482,11 @@ class ArtifactBundle:
         path = self.report_dir / filename
         path.write_text(json.dumps(dict(payload), indent=2, sort_keys=True))
         path_ref = _path_ref_for_bundle(self.bundle_dir, path)
-        self.report_paths[name] = path_ref
         if artifact_key is not None:
             artifact = self.ensure_artifact(artifact_key, precision=artifact_key)
             artifact.report_paths[report_key or name] = path_ref
+        else:
+            self.report_paths[name] = path_ref
         return path
 
     def resolve_report_path(self, path_ref: str) -> Path:
@@ -430,73 +507,63 @@ class ArtifactBundle:
         """Return a human-oriented summary of the bundle and per-artifact state."""
 
         artifacts: dict[str, Any] = {}
-        keys = set(self.artifacts) | set(self.onnx_paths)
-        for key in sorted(keys):
-            artifact = self.artifacts.get(key)
-            artifacts[key] = {
-                "precision": artifact.precision if artifact else key,
-                "num_steps": artifact.num_steps if artifact else (self.num_steps if self.precision == key else None),
-                "calibration_source": (
-                    artifact.calibration_source
-                    if artifact
-                    else (self.calibration_source if self.precision == key else None)
-                ),
-                "calibration_num_samples": (
-                    artifact.calibration_num_samples
-                    if artifact
-                    else (self.calibration_num_samples if self.precision == key else None)
-                ),
-                "onnx_path": artifact.onnx_path if artifact else self.onnx_paths.get(key),
-                "engine_paths": dict(artifact.engine_paths) if artifact else {},
-                "validation_reports": {
-                    report_key: {
-                        "passed": report.passed,
-                        "candidate_path": report.candidate_path,
-                        "mean_cosine": report.mean_cosine,
-                        "mean_abs_error": report.mean_abs_error,
-                        "max_abs_error": report.max_abs_error,
-                    }
-                    for report_key, report in (artifact.validation_reports.items() if artifact else ())
-                },
-                "report_paths": dict(artifact.report_paths) if artifact else {},
-                "recommended_engine_path": artifact.recommended_engine_path if artifact else None,
-            }
-            if verbose and artifact:
-                artifacts[key]["reports"] = {
+        for key in sorted(self.artifacts):
+            artifact = self.artifacts[key]
+            artifacts[key] = artifact.to_dict(bundle_dir=self.bundle_dir)
+            if verbose:
+                artifacts[key]["report_payloads"] = {
                     report_key: _load_json_if_exists(self.resolve_report_path(path_ref))
                     for report_key, path_ref in artifact.report_paths.items()
                 }
-        return {
+
+        bundle_validations = {
+            key: report.to_summary_dict(
+                bundle_dir=self.bundle_dir,
+                report_path=self.report_paths.get(f"validate_{key.replace(':', '_')}"),
+            )
+            for key, report in self.validation_reports.items()
+        }
+
+        status = {
             "bundle_dir": str(self.bundle_dir),
             "config_name": self.config_name,
             "source_checkpoint_dir": self.source_checkpoint_dir,
-            "weight_path": str(self.weight_path) if self.weight_path.exists() else None,
-            "checkpoint_load_report": self.checkpoint_load_report.to_dict() if self.checkpoint_load_report else None,
-            "report_paths": dict(self.report_paths),
-            "recommended_engine": self.recommended_engine,
+            "weight_path": _bundle_path_ref(self.bundle_dir, self.weight_path) if self.weight_path.exists() else None,
+            "checkpoint_load_summary": (
+                self.checkpoint_load_report.to_summary_dict() if self.checkpoint_load_report else None
+            ),
+            "recommended_engine": _bundle_path_ref(self.bundle_dir, self.recommended_engine),
+            "recommended_artifact": self.recommended_artifact,
+            "bundle_validations": bundle_validations,
+            "bundle_reports": {k: _bundle_path_ref(self.bundle_dir, v) for k, v in self.report_paths.items()},
             "artifacts": artifacts,
-            **({"reports": {
+        }
+        if verbose:
+            status["bundle_report_payloads"] = {
                 report_key: _load_json_if_exists(self.resolve_report_path(path_ref))
                 for report_key, path_ref in self.report_paths.items()
-            }} if verbose else {}),
-        }
+            }
+        return status
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "bundle_dir": str(self.bundle_dir),
             "config_name": self.config_name,
             "source_checkpoint_dir": self.source_checkpoint_dir,
-            "precision": self.precision,
-            "num_steps": self.num_steps,
-            "calibration_source": self.calibration_source,
-            "calibration_num_samples": self.calibration_num_samples,
-            "onnx_paths": dict(self.onnx_paths),
-            "engine_paths": dict(self.engine_paths),
-            "checkpoint_load_report": self.checkpoint_load_report.to_dict() if self.checkpoint_load_report else None,
-            "validation_reports": {k: v.to_manifest_dict() for k, v in self.validation_reports.items()},
-            "report_paths": dict(self.report_paths),
-            "artifacts": {k: v.to_dict() for k, v in self.artifacts.items()},
-            "recommended_engine": self.recommended_engine,
+            "recommended_engine": _bundle_path_ref(self.bundle_dir, self.recommended_engine),
+            "recommended_artifact": self.recommended_artifact,
+            "checkpoint_load_summary": (
+                self.checkpoint_load_report.to_summary_dict() if self.checkpoint_load_report else None
+            ),
+            "bundle_validations": {
+                key: report.to_summary_dict(
+                    bundle_dir=self.bundle_dir,
+                    report_path=self.report_paths.get(f"validate_{key.replace(':', '_')}"),
+                )
+                for key, report in self.validation_reports.items()
+            },
+            "bundle_reports": {k: _bundle_path_ref(self.bundle_dir, v) for k, v in self.report_paths.items()},
+            "artifacts": {k: v.to_dict(bundle_dir=self.bundle_dir) for k, v in self.artifacts.items()},
             "extra": dict(self.extra),
         }
 
@@ -512,6 +579,50 @@ class ArtifactBundle:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ArtifactBundle":
+        if "bundle_reports" in data or "checkpoint_load_summary" in data:
+            bundle = cls(
+                bundle_dir=Path(str(data["bundle_dir"])),
+                config_name=str(data["config_name"]),
+                source_checkpoint_dir=str(data["source_checkpoint_dir"]) if data.get("source_checkpoint_dir") else None,
+                checkpoint_load_report=None,
+                validation_reports={
+                    str(k): ValidationReport(
+                        reference_backend=str(v["reference_backend"]),
+                        candidate_backend="pytorch",
+                        config_name=str(data["config_name"]),
+                        reference_path=str(v["reference_path"]) if v.get("reference_path") else None,
+                        reference_precision=str(v["reference_precision"]) if v.get("reference_precision") else None,
+                        num_examples=int(v.get("num_examples", 0)),
+                        passed=bool(v.get("passed", False)),
+                        mean_cosine=float(v.get("mean_cosine", 0.0)),
+                        mean_abs_error=float(v.get("mean_abs_error", 0.0)),
+                        max_abs_error=float(v.get("max_abs_error", 0.0)),
+                    )
+                    for k, v in data.get("bundle_validations", {}).items()
+                },
+                report_paths={str(k): str(v) for k, v in data.get("bundle_reports", {}).items()},
+                artifacts={str(k): ArtifactRecord.from_dict(v) for k, v in data.get("artifacts", {}).items()},
+                recommended_engine=str(data["recommended_engine"]) if data.get("recommended_engine") else None,
+                recommended_artifact=str(data["recommended_artifact"]) if data.get("recommended_artifact") else None,
+                extra=dict(data.get("extra", {})),
+            )
+            checkpoint_summary = data.get("checkpoint_load_summary")
+            if checkpoint_summary:
+                bundle.checkpoint_load_report = CheckpointLoadReport(
+                    total_checkpoint_keys=int(checkpoint_summary.get("total_checkpoint_keys", 0)),
+                    loaded_keys=int(checkpoint_summary.get("loaded_keys", 0)),
+                    unexpected_keys=["<omitted>"] * int(checkpoint_summary.get("unexpected_key_count", 0)),
+                    missing_keys=["<omitted>"] * int(checkpoint_summary.get("missing_key_count", 0)),
+                    shape_mismatches=[
+                        ShapeMismatch(key="<omitted>", checkpoint_shape=(), model_shape=())
+                        for _ in range(int(checkpoint_summary.get("shape_mismatch_count", 0)))
+                    ],
+                    fail_closed=bool(checkpoint_summary.get("fail_closed", True)),
+                    clean=bool(checkpoint_summary.get("clean", True)),
+                )
+            _finalize_loaded_bundle(bundle)
+            return bundle
+
         bundle = cls(
             bundle_dir=Path(str(data["bundle_dir"])),
             config_name=str(data["config_name"]),
@@ -535,10 +646,14 @@ class ArtifactBundle:
             report_paths={str(k): str(v) for k, v in data.get("report_paths", {}).items()},
             artifacts={str(k): ArtifactRecord.from_dict(v) for k, v in data.get("artifacts", {}).items()},
             recommended_engine=str(data["recommended_engine"]) if data.get("recommended_engine") else None,
+            recommended_artifact=(
+                str(data["recommended_artifact"]) if data.get("recommended_artifact") else None
+            ),
             extra=dict(data.get("extra", {})),
         )
         if not bundle.artifacts:
             _migrate_legacy_bundle_artifacts(bundle)
+        _finalize_loaded_bundle(bundle)
         return bundle
 
     @classmethod
@@ -551,6 +666,7 @@ class ArtifactBundle:
             raise FileNotFoundError(f"Bundle metadata not found at {metadata_path}")
         bundle = cls.from_dict(json.loads(metadata_path.read_text()))
         bundle.bundle_dir = bundle_path
+        _finalize_loaded_bundle(bundle)
         return bundle
 
 
@@ -572,6 +688,24 @@ def _path_ref_for_bundle(bundle_dir: Path, path: Path) -> str:
         return str(path.relative_to(bundle_dir))
     except ValueError:
         return str(path)
+
+
+def _bundle_path_ref(bundle_dir: Path, path_ref: str | Path | None) -> str | None:
+    if path_ref is None:
+        return None
+    path = Path(str(path_ref))
+    if not path.is_absolute():
+        return str(path)
+    return _path_ref_for_bundle(bundle_dir, path)
+
+
+def _resolve_bundle_file_path(bundle_dir: Path, path_ref: str | None) -> str | None:
+    if path_ref is None:
+        return None
+    path = Path(path_ref)
+    if path.is_absolute():
+        return str(path.expanduser().resolve())
+    return str((bundle_dir / path).expanduser().resolve())
 
 
 def _load_json_if_exists(path: Path) -> dict[str, Any] | None:
@@ -630,3 +764,84 @@ def _migrate_legacy_bundle_artifacts(bundle: ArtifactBundle) -> None:
         artifact_key = _legacy_precision_from_name(bundle.recommended_engine, fallback=bundle.precision)
         if artifact_key is not None:
             bundle.set_recommended_engine(bundle.recommended_engine, artifact_key=artifact_key)
+
+
+def _finalize_loaded_bundle(bundle: ArtifactBundle) -> None:
+    """Normalize a loaded bundle so runtime code sees resolved paths and deduplicated indexes."""
+
+    for artifact in bundle.artifacts.values():
+        if artifact.onnx_path is not None:
+            artifact.onnx_path = _resolve_bundle_file_path(bundle.bundle_dir, artifact.onnx_path)
+        artifact.engine_paths = {
+            key: _resolve_bundle_file_path(bundle.bundle_dir, path_ref) or str(path_ref)
+            for key, path_ref in artifact.engine_paths.items()
+        }
+        artifact.report_paths = {
+            key: _bundle_path_ref(bundle.bundle_dir, path_ref) or str(path_ref)
+            for key, path_ref in artifact.report_paths.items()
+        }
+        if artifact.recommended_engine_path is not None:
+            artifact.recommended_engine_path = _resolve_bundle_file_path(bundle.bundle_dir, artifact.recommended_engine_path)
+        for report in artifact.validation_reports.values():
+            if not report.config_name:
+                report.config_name = bundle.config_name
+            if not report.candidate_backend:
+                report.candidate_backend = "tensorrt"
+            if report.precision is None:
+                report.precision = artifact.precision
+            if report.reference_path is not None:
+                report.reference_path = _resolve_bundle_file_path(bundle.bundle_dir, report.reference_path)
+
+    if bundle.recommended_engine is not None:
+        bundle.recommended_engine = _resolve_bundle_file_path(bundle.bundle_dir, bundle.recommended_engine)
+    bundle.report_paths = {
+        key: _bundle_path_ref(bundle.bundle_dir, path_ref) or str(path_ref)
+        for key, path_ref in bundle.report_paths.items()
+    }
+    for report in bundle.validation_reports.values():
+        if not report.config_name:
+            report.config_name = bundle.config_name
+        if report.reference_path is not None:
+            report.reference_path = _resolve_bundle_file_path(bundle.bundle_dir, report.reference_path)
+
+    artifact_validation_keys = {
+        key
+        for artifact in bundle.artifacts.values()
+        for key in artifact.validation_reports
+    }
+    bundle.validation_reports = {
+        key: report for key, report in bundle.validation_reports.items() if key not in artifact_validation_keys
+    }
+
+    artifact_report_paths = {
+        path_ref
+        for artifact in bundle.artifacts.values()
+        for path_ref in artifact.report_paths.values()
+    }
+    bundle.report_paths = {
+        key: path_ref for key, path_ref in bundle.report_paths.items() if path_ref not in artifact_report_paths
+    }
+
+    bundle.onnx_paths = {}
+    bundle.engine_paths = {}
+    for artifact_key, artifact in bundle.artifacts.items():
+        if artifact.onnx_path is not None:
+            bundle.onnx_paths[artifact_key] = artifact.onnx_path
+        bundle.engine_paths.update(artifact.engine_paths)
+
+    if bundle.recommended_artifact is None and bundle.recommended_engine is not None:
+        resolved = Path(bundle.recommended_engine)
+        for artifact_key, artifact in bundle.artifacts.items():
+            if artifact.recommended_engine_path and Path(artifact.recommended_engine_path) == resolved:
+                bundle.recommended_artifact = artifact_key
+                break
+            if any(Path(path_ref) == resolved for path_ref in artifact.engine_paths.values()):
+                bundle.recommended_artifact = artifact_key
+                break
+
+    if bundle.precision is None:
+        if bundle.recommended_artifact is not None and bundle.recommended_artifact in bundle.artifacts:
+            bundle.precision = bundle.artifacts[bundle.recommended_artifact].precision
+        elif len(bundle.artifacts) == 1:
+            only_key = next(iter(bundle.artifacts))
+            bundle.precision = bundle.artifacts[only_key].precision
